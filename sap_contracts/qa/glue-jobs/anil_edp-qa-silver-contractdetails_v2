@@ -1,0 +1,320 @@
+# ============================================================
+# EDP SILVER GLUE JOB (CONTRACT DETAILS)
+# SCD TYPE 1 + AUDIT (HEADER + ITEMS) - WINDOW LOGIC
+# ============================================================
+
+import sys
+import logging
+import re
+
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, lit, input_file_name, regexp_extract, explode_outer,
+    to_date, current_timestamp, row_number
+)
+from pyspark.sql.types import DecimalType
+from pyspark.sql.window import Window
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# HELPER
+# ============================================================
+
+def to_snake_case_unique(columns):
+    seen, new_cols = {}, []
+    for c in columns:
+        nc = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", c)
+        nc = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", nc).lower()
+        if nc in seen:
+            seen[nc] += 1
+            nc = f"{nc}_{seen[nc]}"
+        else:
+            seen[nc] = 0
+        new_cols.append(nc)
+    return new_cols
+
+# ============================================================
+# ARGUMENTS
+# ============================================================
+
+args = getResolvedOptions(sys.argv, [
+    "JOB_NAME","ACCOUNT_ID","BRONZE_BUCKET_NAME","ETL_RUN_DATE",
+    "EXECUTION_ID","AIRFLOW_RUN_ID","SILVER_DATABASE",
+    "SOURCE","TABLE_BUCKET_NAME","AWS_REGION"
+])
+
+JOB_NAME = args["JOB_NAME"]
+ACCOUNT_ID = args["ACCOUNT_ID"]
+ETL_RUN_DATE = args["ETL_RUN_DATE"]
+EXECUTION_ID = args["EXECUTION_ID"]
+AIRFLOW_RUN_ID = args["AIRFLOW_RUN_ID"]
+DB = args["SILVER_DATABASE"]
+SOURCE = args["SOURCE"]
+AWS_REGION = args["AWS_REGION"]
+TABLE_BUCKET_NAME = args["TABLE_BUCKET_NAME"]
+GLUE_JOB_RUN_ID = args.get("JOB_RUN_ID")
+AUDIT_BUCKET_NAME='epiq-edp-dl-dev-configs'
+
+
+# ============================================================
+# SPARK CONFIG
+# ============================================================
+
+spark = (
+    SparkSession.builder.appName(JOB_NAME)
+    # ── Iceberg SQL extensions (required for both catalogs) ──
+    .config(
+        "spark.sql.extensions",
+        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+    )
+    # ── Default catalog: s3tables ────────────────────────────
+    .config("spark.sql.defaultCatalog", "s3tables")
+    # ── s3tables catalog (S3 Tables / Iceberg) ───────────────
+    .config("spark.sql.catalog.s3tables", "org.apache.iceberg.spark.SparkCatalog")
+    .config(
+        "spark.sql.catalog.s3tables.catalog-impl",
+        "org.apache.iceberg.aws.glue.GlueCatalog",
+    )
+    .config(
+        "spark.sql.catalog.s3tables.glue.id",
+        f"{ACCOUNT_ID}:s3tablescatalog/{TABLE_BUCKET_NAME}",
+    )
+    .config(
+        "spark.sql.catalog.s3tables.warehouse",
+        f"s3://{TABLE_BUCKET_NAME}",
+    )
+    .config(
+        "spark.sql.catalog.s3tables.io-impl",
+        "org.apache.iceberg.aws.s3.S3FileIO",
+    )
+    .config(
+        "spark.sql.catalog.s3tables.client.region",
+        AWS_REGION,
+    )
+    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config(
+        "spark.sql.catalog.glue_catalog.catalog-impl",
+        "org.apache.iceberg.aws.glue.GlueCatalog",
+    )
+    .config(
+        "spark.sql.catalog.glue_catalog.warehouse",
+        f"s3://{AUDIT_BUCKET_NAME}/iceberg-warehouse",
+    )
+    .config(
+        "spark.sql.catalog.glue_catalog.io-impl",
+        "org.apache.iceberg.aws.s3.S3FileIO",
+    )
+    .config(
+        "spark.sql.catalog.glue_catalog.client.region",
+        AWS_REGION,
+    )
+    # ── Parquet compatibility ─────────────────────────────────
+    .config("spark.sql.parquet.datetimeRebaseModeInRead", "CORRECTED")
+    .config("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+    .getOrCreate()
+)
+
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
+job.init(JOB_NAME, args)
+
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS s3tables.{DB}")
+spark.sql(f"USE s3tables.{DB}")
+
+# ============================================================
+# READ
+# ============================================================
+
+def read_bronze():
+    path = f"s3://{args['BRONZE_BUCKET_NAME']}/sap/contracts/contractdetails/{ETL_RUN_DATE.replace('-', '/')}/"
+    df = spark.read.format("json").option("recursiveFileLookup","true").load(path)
+
+    return (
+        df.withColumn("file_path", input_file_name())
+          .withColumn("source_identifier", regexp_extract(col("file_path"), r"/([^/]+)/[^/]+$", 1))
+          .drop("file_path")
+    )
+
+# ============================================================
+# WINDOW HELPER (LATEST RECORD)
+# ============================================================
+
+def get_latest(df, partition_cols):
+    window_spec = Window.partitionBy(*partition_cols).orderBy(col("ingestion_ts").desc())
+    return df.withColumn("rn", row_number().over(window_spec)).filter("rn=1").drop("rn")
+
+# ============================================================
+# TRANSFORM
+# ============================================================
+
+def transform(df):
+
+    df = df.toDF(*to_snake_case_unique(df.columns))
+
+    df = (
+        df.withColumn("execution_id", lit(EXECUTION_ID))
+          .withColumn("airflow_run_id", lit(AIRFLOW_RUN_ID))
+          .withColumn("etl_run_date", lit(ETL_RUN_DATE))
+          .withColumn("source_system", lit(SOURCE))
+          .withColumn("ingestion_ts", current_timestamp())
+    )
+
+    df = (
+        df.withColumn("contract_number", col("contract_number").cast("string"))
+          .withColumn("contract_start_date", to_date(col("contract_start_date")))
+          .withColumn("pricing_date", to_date(col("pricing_date")))
+          .withColumn("annual_price_esc_override_percent",
+                      col("annual_price_esc_override_percent").cast(DecimalType(5,2)))
+    )
+
+    # ================= HEADER =================
+    df_header = df.select(
+        "contract_number","contract_description","contract_start_date",
+        "sales_organization","doc_currency","sold_to_party",
+        "sold_to_party_text","bill_to_party","bill_to_party_text",
+        "payer","ship_to_party","primary_project_manager",
+        "sales_office","sales_group","client_matter",
+        "customer_reference","ls_project_code","pricing_date",
+        "header_billing_block","material_contribution_flag",
+        "annual_price_esc_override_percent",
+        "annual_price_esc_contract_language","project_number",
+        "customer_group","source_identifier","execution_id",
+        "airflow_run_id","etl_run_date","source_system","ingestion_ts"
+    )
+
+    df_header = get_latest(df_header, ["contract_number"])
+
+    # ================= ITEMS =================
+    df_items = df.withColumn("contract_item", explode_outer("contract_items"))
+
+    df_items = df_items.select(
+        col("contract_number"),
+        col("contract_item.ItemId").alias("item_id"),
+        col("contract_item.Material").alias("material"),
+        col("contract_item.ItemDescription").alias("item_description"),
+        col("contract_item.ItemCategory").alias("item_category"),
+        col("contract_item.HighLevelItem").alias("high_level_item"),
+        col("contract_item.OrderQuantity").cast(DecimalType(15,3)).alias("order_quantity"),
+        col("contract_item.NetValue").cast(DecimalType(15,2)).alias("net_value"),
+        col("contract_item.DismantlingDate").cast("date").alias("dismantling_date"),
+        col("source_identifier"),col("execution_id"),
+        col("airflow_run_id"),col("etl_run_date"),
+        col("source_system"),col("ingestion_ts")
+    )
+
+    df_items = get_latest(df_items, ["contract_number","item_id"])
+
+    return df_header, df_items
+
+# ============================================================
+# SCD1 LOGIC
+# ============================================================
+
+def upsert_scd1(df_incoming, table_name, keys):
+
+    df_existing = spark.table(table_name.split(".")[-1])
+
+    df_unchanged = df_existing.join(
+        df_incoming.select(*keys).distinct(),
+        keys,
+        "left_anti"
+    )
+
+    df_final = df_unchanged.unionByName(df_incoming, True)
+
+    df_final.writeTo(table_name).overwrite(lit(True))
+
+    return (
+        df_incoming.count(),
+        df_final.count(),
+        df_incoming.count(),
+        df_existing.count() - df_unchanged.count()
+    )
+
+# ============================================================
+# AUDIT
+# ============================================================
+
+def update_audit(r, w, i, u, table_name):
+    spark.sql(f"""
+        UPDATE glue_catalog.edp_configs_dev.pipeline_execution_summary
+        SET records_read = {r},
+            records_written = {w},
+            records_inserted = {i},
+            records_updated = {u},
+            glue_job_run_id = '{GLUE_JOB_RUN_ID}',
+            error_message = NULL
+        WHERE etl_run_id = '{EXECUTION_ID}'
+          AND layer = 'SILVER'
+          AND table_name = '{table_name}'
+    """)
+
+# ============================================================
+# ERROR AUDIT HELPER
+# ============================================================
+
+def update_error_audit(error_msg, table_names):
+    """Update audit table for multiple tables in case of error"""
+    for table_name in table_names:
+        try:
+            spark.sql(f"""
+                UPDATE glue_catalog.edp_configs_dev.pipeline_execution_summary
+                SET error_message = '{error_msg}',
+                    glue_job_run_id = {f"'{GLUE_JOB_RUN_ID}'" if GLUE_JOB_RUN_ID else "NULL"}
+                WHERE etl_run_id = '{EXECUTION_ID}'
+                  AND layer = 'SILVER'
+                  AND table_name = '{table_name}'
+            """)
+        except Exception as audit_error:
+            logger.error(f"Failed to update audit for {table_name}: {audit_error}")
+
+# ============================================================
+# MAIN
+# ============================================================
+
+# Define table names at module level
+HEADER_TABLE_NAME = 'contracts_header'
+ITEMS_TABLE_NAME = 'contracts_items'
+
+try:
+
+    df = read_bronze()
+
+    if df.rdd.isEmpty():
+        logger.info("No data found")
+        job.commit()
+        sys.exit(0)
+
+    df_header, df_items = transform(df)
+
+    header_table = f"s3tables.{DB}.{HEADER_TABLE_NAME}"
+    items_table = f"s3tables.{DB}.{ITEMS_TABLE_NAME}"
+
+    logger.info("Processing HEADER")
+    h = upsert_scd1(df_header, header_table, ["contract_number"])
+    update_audit(*h, HEADER_TABLE_NAME)
+
+    logger.info("Processing ITEMS")
+    i = upsert_scd1(df_items, items_table, ["contract_number","item_id"])
+    update_audit(*i, ITEMS_TABLE_NAME)
+
+    job.commit()
+
+except Exception as e:
+    error_msg = str(e).replace("'", " ")[:500]
+    logger.error(f"Job failed with error: {error_msg}")
+
+    # Update audit for both tables
+    update_error_audit(error_msg, [HEADER_TABLE_NAME, ITEMS_TABLE_NAME])
+
+    raise

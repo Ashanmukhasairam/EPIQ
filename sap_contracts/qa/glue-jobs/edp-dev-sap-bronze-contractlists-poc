@@ -1,0 +1,306 @@
+import sys
+import json
+import logging
+import boto3
+import requests
+import os
+from datetime import datetime, timezone
+from requests.auth import HTTPBasicAuth
+from pyspark.sql import DataFrame
+from functools import reduce
+
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType
+
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info("===== JOB STARTED =====")
+
+# --------------------------------------------------
+# Parameters
+# --------------------------------------------------
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "TABLE_NAME",
+        "PREVIOUS_DATE_TIME",
+        "NEXT_DATE_TIME",
+        "EXECUTION_ID",
+        "AIRFLOW_RUN_ID",
+        "ETL_RUN_DATE",
+        "SECRET_NAME",
+        "BUCKET_NAME",
+        "SOURCE_SYSTEM",
+    ],
+)
+
+JOB_NAME = args["JOB_NAME"]
+TABLE_NAME = args["TABLE_NAME"]
+PREVIOUS_DATE_TIME = args["PREVIOUS_DATE_TIME"]
+NEXT_DATE_TIME = args["NEXT_DATE_TIME"]           
+EXECUTION_ID = args["EXECUTION_ID"]
+SECRET_NAME = args["SECRET_NAME"]
+BUCKET_NAME = args["BUCKET_NAME"]
+SOURCE_SYSTEM = args["SOURCE_SYSTEM"].lower()
+
+prev_dt = datetime.strptime(PREVIOUS_DATE_TIME, "%Y-%m-%d %H:%M:%S")
+next_dt = datetime.strptime(NEXT_DATE_TIME, "%Y-%m-%d %H:%M:%S")
+
+PREVIOUS_DATE = prev_dt.strftime("%Y-%m-%d")
+PREVIOUS_TIME = prev_dt.strftime("%H:%M:%S")
+
+NEXT_DATE = next_dt.strftime("%Y-%m-%d")
+NEXT_TIME = next_dt.strftime("%H:%M:%S")
+
+# --------------------------------------------------
+# Load Timestamp
+# --------------------------------------------------
+LOAD_TIME = datetime.now(timezone.utc).strftime("%Y/%m/%d/%H/%M")
+
+# --------------------------------------------------
+# Spark Session
+# --------------------------------------------------
+spark = (
+    SparkSession.builder.appName(JOB_NAME)
+    .config("spark.sql.session.timeZone", "UTC")
+    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config(
+        "spark.sql.catalog.glue_catalog.catalog-impl",
+        "org.apache.iceberg.aws.glue.GlueCatalog",
+    )
+    .config(
+        "spark.sql.catalog.glue_catalog.io-impl",
+        "org.apache.iceberg.aws.s3.S3FileIO",
+    )
+    .config("spark.sql.catalog.glue_catalog.warehouse", f"s3://{BUCKET_NAME}/")
+    .getOrCreate()
+)
+
+glueContext = GlueContext(spark.sparkContext)
+
+job = Job(glueContext)
+job.init(JOB_NAME, args)
+
+logger.info("Spark initialized")
+
+# --------------------------------------------------
+# Glue Job Run ID
+# --------------------------------------------------
+glue_client = boto3.client("glue")
+GLUE_JOB_RUN_ID = glue_client.get_job_runs(JobName=JOB_NAME, MaxResults=1)["JobRuns"][0]["Id"]
+
+logger.info(f"Glue Job Run ID: {GLUE_JOB_RUN_ID}")
+
+# --------------------------------------------------
+# Explicit Schema
+# --------------------------------------------------
+schema = StructType(
+    [
+        StructField("ContractNumber", StringType(), True),
+        StructField("SalesOrganization", StringType(), True),
+        StructField("ContractDate", StringType(), True),
+        StructField("CreatedDate", StringType(), True),
+        StructField("ChangedDate", StringType(), True),
+        StructField("ContractTime", StringType(), True),
+        StructField("attribute", StringType(), True),
+    ]
+)
+
+# --------------------------------------------------
+# Get Secrets
+# --------------------------------------------------
+def get_credentials(secret_name):
+    client = boto3.client("secretsmanager")
+    secret = client.get_secret_value(SecretId=secret_name)["SecretString"]
+    creds = json.loads(secret)
+    
+    return (
+        creds["username"],
+        creds["password"],
+        creds["sap_base_url"],
+        creds["sap_path"],
+    )
+
+username, password, sap_base_url, sap_path = get_credentials(SECRET_NAME)
+
+# --------------------------------------------------
+# API Wrapper
+# --------------------------------------------------
+def call_api(url):
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                url,
+                auth=HTTPBasicAuth(username, password),
+                timeout=60,
+            )
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.warning(f"API retry {attempt+1} failed: {str(e)}")
+
+    raise Exception("API failed after retries")
+
+# --------------------------------------------------
+# Fetch Contracts
+# --------------------------------------------------
+def fetch_contracts(action):
+
+    logger.info(f"Fetching {action} contracts")
+
+    records = []
+
+    url = (
+        f"{sap_base_url}{sap_path}ZSD_API_CONTRACT_LIST"
+        f"?$filter=ContractDate ge {PREVIOUS_DATE}"
+        f" and ContractDate le {NEXT_DATE}"
+        f" and ContractTime ge {PREVIOUS_TIME}"
+        f" and ContractTime le {NEXT_TIME}"
+        f" and attribute eq '{action}'"
+        "&$select=ContractNumber,SalesOrganization,ContractDate,CreatedDate,ChangedDate,ContractTime"
+        "&$top=5000"
+        "&$format=json"
+    )
+
+    logger.info(f"Calling API URL: {url}")
+
+    while url:
+
+        data = call_api(url)
+        batch = data.get("value", [])
+
+        if batch:
+            for r in batch:
+
+                if "ContractTime" not in r:
+                    r["ContractTime"] = None
+
+                if "attribute" not in r:
+                    r["attribute"] = action
+
+                records.append(r)
+
+        url = data.get("@odata.nextLink")
+
+    logger.info(f"{action} records fetched: {len(records)}")
+
+    return records
+
+# --------------------------------------------------
+# Write JSON
+# --------------------------------------------------
+def write_json(data):
+
+    path = (
+        f"s3://{BUCKET_NAME}/{SOURCE_SYSTEM}/contracts/testing/{TABLE_NAME}/"
+        f"{LOAD_TIME}/{EXECUTION_ID}/"
+    )
+
+    if data:
+        df = spark.createDataFrame(data, schema=schema)
+    else:
+        df = spark.createDataFrame([], schema)
+
+    df = df.select(
+        "ContractNumber",
+        "SalesOrganization",
+        "ContractDate",
+        "CreatedDate",
+        "ChangedDate",
+        "ContractTime",
+        "attribute",
+    )
+
+    df.coalesce(1).write.mode("append").json(path)
+
+    logger.info(f"File written to S3 path: {path}")
+
+    return len(data)
+
+# --------------------------------------------------
+# Historical Dates Loop
+# --------------------------------------------------
+dates = [
+    "1/23/2024",
+    "12/31/2024",
+    "2/26/2025",
+    "4/3/2025",
+    "6/26/2025",
+    "7/31/2025",
+    "9/4/2025",
+    "11/21/2025",
+    "12/16/2025",
+    "2/10/2026",
+    "3/26/2026",
+    "4/9/2026",
+]
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
+try:
+
+    logger.info("===== PIPELINE START =====")
+
+    all_dataframes = []
+
+    for raw_date in dates:
+
+        dt = datetime.strptime(raw_date, "%m/%d/%Y")
+
+        PREVIOUS_DATE = dt.strftime("%Y-%m-%d")
+        NEXT_DATE     = dt.strftime("%Y-%m-%d")
+
+        PREVIOUS_TIME = "00:00:00"
+        NEXT_TIME     = "23:59:00"
+
+        logger.info(f"Processing date: {PREVIOUS_DATE} | Time window: {PREVIOUS_TIME} → {NEXT_TIME}")
+
+        create_records = fetch_contracts("CREATE")
+        change_records = fetch_contracts("CHANGE")
+
+        all_records = create_records + change_records
+
+        logger.info(f"[{raw_date}] Total records fetched: {len(all_records)}")
+
+        if all_records:
+            df = spark.createDataFrame(all_records, schema=schema)
+        else:
+            df = spark.createDataFrame([], schema)
+
+        all_dataframes.append(df)
+
+    # --------------------------------------------------
+    # Combine all dates into one DataFrame
+    # --------------------------------------------------
+    if all_dataframes:
+        final_df = reduce(DataFrame.union, all_dataframes)
+    else:
+        final_df = spark.createDataFrame([], schema)
+
+    total_read = final_df.count()
+
+    logger.info(f"Total combined records across all dates: {total_read}")
+
+    if total_read == 0:
+        logger.info("No data found across all dates")
+
+    total_written = write_json(final_df.toJSON().map(json.loads).collect())
+
+    logger.info(f"Records Read: {total_read}")
+    logger.info(f"Records Written: {total_written}")
+
+    job.commit()
+
+    logger.info("===== JOB COMPLETED SUCCESSFULLY =====")
+
+except Exception as e:
+    logger.error("===== JOB FAILED =====")
+    raise

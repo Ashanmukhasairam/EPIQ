@@ -1,0 +1,192 @@
+# ============================================================
+# EDP GOLD GLUE JOB (TRUNCATE + FULL LOAD)
+# ============================================================
+# Source: Silver Iceberg table (SILVER_BUCKET)
+# Target: Gold Iceberg table (GOLD_BUCKET)
+#
+# Generic, reusable job for all Salesforce objects:
+#   account, campaign, opportunity, lead, contact
+#
+# Strategy: Full load from silver → gold every run.
+# Silver already has SCD Type 1 applied (one row per primary
+# key), so gold simply mirrors silver minus operational columns.
+# ============================================================
+
+import sys
+import logging
+
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit, current_timestamp
+
+# ============================================================
+# Logging
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Arguments
+# ============================================================
+
+args = getResolvedOptions(sys.argv, [
+    "JOB_NAME",
+    "ACCOUNT_ID",
+    "SILVER_BUCKET",
+    "GOLD_BUCKET",
+    "SILVER_DATABASE",
+    "GOLD_DATABASE",
+    "TABLE_NAME",
+    "EXECUTION_ID",
+    "AWS_REGION",
+])
+
+JOB_NAME      = args["JOB_NAME"]
+ACCOUNT_ID    = args["ACCOUNT_ID"]
+SILVER_BUCKET = args["SILVER_BUCKET"]
+GOLD_BUCKET   = args["GOLD_BUCKET"]
+SILVER_DB     = args["SILVER_DATABASE"]
+GOLD_DB       = args["GOLD_DATABASE"]
+TABLE_NAME    = args["TABLE_NAME"]
+EXECUTION_ID  = args["EXECUTION_ID"]
+AWS_REGION    = args["AWS_REGION"]
+
+AUDIT_BUCKET_NAME = 'epiq-edp-dl-dev-configs'
+GLUE_JOB_RUN_ID = args.get("JOB_RUN_ID")
+
+# ============================================================
+# Spark + Iceberg (two catalogs - silver & gold buckets)
+# ============================================================
+
+spark = (
+    SparkSession.builder.appName(JOB_NAME)
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+
+    # Silver catalog
+    .config("spark.sql.catalog.silver_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.silver_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config("spark.sql.catalog.silver_catalog.glue.id", f"{ACCOUNT_ID}:s3tablescatalog/{SILVER_BUCKET}")
+    .config("spark.sql.catalog.silver_catalog.warehouse", f"s3://{SILVER_BUCKET}")
+    .config("spark.sql.catalog.silver_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.silver_catalog.client.region", AWS_REGION)
+
+    # Gold catalog
+    .config("spark.sql.catalog.gold_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.gold_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config("spark.sql.catalog.gold_catalog.glue.id", f"{ACCOUNT_ID}:s3tablescatalog/{GOLD_BUCKET}")
+    .config("spark.sql.catalog.gold_catalog.warehouse", f"s3://{GOLD_BUCKET}")
+    .config("spark.sql.catalog.gold_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.gold_catalog.client.region", AWS_REGION)
+
+    # Glue catalog - audit table only
+    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config("spark.sql.catalog.glue_catalog.warehouse", f"s3://{AUDIT_BUCKET_NAME}/iceberg-warehouse")
+    .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.glue_catalog.client.region", AWS_REGION)
+
+    .getOrCreate()
+)
+
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
+job.init(JOB_NAME, args)
+
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS gold_catalog.{GOLD_DB}")
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+
+TABLES = ["contract_header", "contract_items"]
+
+DROP_COLUMNS = ["execution_id", "airflow_run_id", "source_identifier"]
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def process_table(table_name):
+    logger.info(f"Processing {table_name}")
+    
+    # Read Silver
+    silver_table = f"silver_catalog.{SILVER_DB}.{table_name}"
+    df = spark.table(silver_table)
+    
+    # Drop operational columns
+    for col in DROP_COLUMNS:
+        if col in df.columns:
+            df = df.drop(col)
+    
+    # Count records
+    count = df.count()
+    if count == 0:
+        logger.info(f"No data in {table_name}")
+        return 0
+    
+    # Write to Gold (truncate & load)
+    gold_table = f"gold_catalog.{GOLD_DB}.{table_name}"
+    df.writeTo(gold_table).overwrite(lit(True))
+    
+    logger.info(f"Loaded {count} records to {table_name}")
+    return count
+
+def update_audit(table_name, count, error_msg=None):
+    try:
+        if error_msg:
+            # Clean error message for SQL safety
+            clean_error = error_msg.replace("'", "''")[:500]
+            spark.sql(f"""
+                UPDATE glue_catalog.edp_configs_dev.pipeline_execution_summary
+                SET error_message = '{clean_error}',
+                    glue_job_run_id = '{GLUE_JOB_RUN_ID or "NULL"}'
+                WHERE etl_run_id = '{EXECUTION_ID}' 
+                  AND layer = 'GOLD' 
+                  AND table_name = '{table_name}'
+            """)
+        else:
+            spark.sql(f"""
+                UPDATE glue_catalog.edp_configs_dev.pipeline_execution_summary
+                SET records_read = {count}, 
+                    records_written = {count}, 
+                    records_inserted = {count},
+                    records_updated = 0, 
+                    records_deleted = 0, 
+                    records_rejected = 0,
+                    glue_job_run_id = '{GLUE_JOB_RUN_ID}', 
+                    error_message = NULL
+                WHERE etl_run_id = '{EXECUTION_ID}' 
+                  AND layer = 'GOLD' 
+                  AND table_name = '{table_name}'
+            """)
+    except Exception as e:
+        logger.error(f"Audit update failed for {table_name}: {e}")
+
+# ============================================================
+# MAIN
+# ============================================================
+
+try:
+    logger.info(f"Starting Gold ETL for tables: {TABLES}")
+    
+    for table in TABLES:
+        try:
+            count = process_table(table)
+            update_audit(table, count)
+        except Exception as e:
+            error_msg = str(e).replace("'", " ")
+            logger.error(f"Failed processing {table}: {error_msg}")
+            update_audit(table, 0, error_msg)
+            raise
+    
+    job.commit()
+    logger.info("Job completed successfully")
+
+except Exception as e:
+    logger.error(f"Job failed: {e}")
+    raise

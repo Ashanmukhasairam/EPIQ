@@ -1,0 +1,328 @@
+# ============================================================
+# EDP SILVER GLUE JOB
+# ============================================================
+
+import sys
+import logging
+import re
+
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+from pyspark.sql.functions import (
+    col,
+    lit,
+    current_timestamp,
+    row_number,
+    input_file_name,
+    regexp_extract,
+    when,
+    to_date,
+)
+
+# ============================================================
+# Logging
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Helper
+# ============================================================
+
+
+def to_snake_case_unique(columns):
+    seen = {}
+    new_cols = []
+
+    for col_name in columns:
+        new_col = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", col_name)
+        new_col = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", new_col)
+        new_col = new_col.lower()
+
+        if new_col in seen:
+            seen[new_col] += 1
+            new_col = f"{new_col}_{seen[new_col]}"
+        else:
+            seen[new_col] = 0
+
+        new_cols.append(new_col)
+
+    return new_cols
+
+
+# ============================================================
+# Arguments
+# ============================================================
+
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "ACCOUNT_ID",
+        "BRONZE_BUCKET_NAME",
+        "ETL_RUN_DATE",
+        "EXECUTION_ID",
+        "AIRFLOW_RUN_ID",
+        "SILVER_DATABASE",
+        "SOURCE",
+        "TABLE_BUCKET_NAME",
+        "SILVER_TABLE",
+        "AWS_REGION",
+    ],
+)
+
+JOB_NAME = args["JOB_NAME"]
+ACCOUNT_ID = args["ACCOUNT_ID"]
+ETL_RUN_DATE = args["ETL_RUN_DATE"]
+EXECUTION_ID = args["EXECUTION_ID"]
+AIRFLOW_RUN_ID = args["AIRFLOW_RUN_ID"]
+DB = args["SILVER_DATABASE"]
+SOURCE = args["SOURCE"]
+TABLE_BUCKET_NAME = args["TABLE_BUCKET_NAME"]
+OBJECT_NAME = args["SILVER_TABLE"]
+AWS_REGION = args["AWS_REGION"]
+AUDIT_BUCKET_NAME = "epiq-edp-dl-dev-configs"
+
+# ============================================================
+# Spark Configuration
+# ============================================================
+
+spark = (
+    SparkSession.builder.appName(JOB_NAME)
+    .config(
+        "spark.sql.extensions",
+        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+    )
+    .config("spark.sql.defaultCatalog", "s3tables")
+    .config("spark.sql.catalog.s3tables", "org.apache.iceberg.spark.SparkCatalog")
+    .config(
+        "spark.sql.catalog.s3tables.catalog-impl",
+        "org.apache.iceberg.aws.glue.GlueCatalog",
+    )
+    .config(
+        "spark.sql.catalog.s3tables.glue.id",
+        f"{ACCOUNT_ID}:s3tablescatalog/{TABLE_BUCKET_NAME}",
+    )
+    .config("spark.sql.catalog.s3tables.warehouse", f"s3://{TABLE_BUCKET_NAME}")
+    .config("spark.sql.catalog.s3tables.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.s3tables.client.region", AWS_REGION)
+    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config(
+        "spark.sql.catalog.glue_catalog.catalog-impl",
+        "org.apache.iceberg.aws.glue.GlueCatalog",
+    )
+    .config(
+        "spark.sql.catalog.glue_catalog.warehouse",
+        f"s3://{AUDIT_BUCKET_NAME}/iceberg-warehouse",
+    )
+    .config(
+        "spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"
+    )
+    .config("spark.sql.catalog.glue_catalog.client.region", AWS_REGION)
+    .config("spark.sql.parquet.datetimeRebaseModeInRead", "CORRECTED")
+    .config("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+    .getOrCreate()
+)
+
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
+job.init(JOB_NAME, args)
+
+logger.info("Registered catalogs:")
+spark.sql("SHOW CATALOGS").show(truncate=False)
+
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS s3tables.{DB}")
+spark.sql(f"USE s3tables.{DB}")
+
+# ============================================================
+# READ BRONZE
+# ============================================================
+
+
+def read_bronze():
+
+    path = f"s3://{args['BRONZE_BUCKET_NAME']}/sap/contracts/contractlist/{ETL_RUN_DATE.replace('-', '/')}/"
+
+    df = spark.read.format("json").option("recursiveFileLookup", "true").load(path)
+
+    df = df.withColumn("file_path", input_file_name())
+
+    sample_paths = df.select("file_path").limit(3).collect()
+    for row in sample_paths:
+        logger.info(f"Sample file_path: {row['file_path']}")
+
+    df = df.withColumn(
+        "source_identifier",
+        regexp_extract(col("file_path"), r"/([^/]+)/[^/]+$", 1),
+    )
+
+    df = df.drop("file_path")
+
+    return df
+
+
+# ============================================================
+# TRANSFORM
+# ============================================================
+
+
+def transform(df):
+
+    if "file_path" in df.columns:
+        df = df.drop("file_path")
+
+    # Rename columns
+    new_cols = to_snake_case_unique(df.columns)
+    df = df.toDF(*new_cols)
+
+    df = (
+        df.withColumn("contract_number", col("contract_number").cast("string"))
+        .withColumn("sales_organization", col("sales_organization").cast("string"))
+        .withColumn("source_identifier", col("source_identifier").cast("string"))
+        .withColumn("contract_date", to_date(col("contract_date")))
+        .withColumn("created_date", to_date(col("created_date")))
+        .withColumn("changed_date", to_date(col("changed_date")))
+    )
+
+    df = df.withColumn(
+        "effective_date",
+        when(col("changed_date").isNotNull(), col("changed_date")).otherwise(
+            col("created_date")
+        ),
+    )
+
+    # Audit Columns
+    df = (
+        df.withColumn("execution_id", lit(EXECUTION_ID))
+        .withColumn("airflow_run_id", lit(AIRFLOW_RUN_ID))
+        .withColumn("etl_run_date", lit(ETL_RUN_DATE))
+        .withColumn("source_system", lit(SOURCE))
+        .withColumn("ingestion_ts", current_timestamp())
+    )
+
+    window = Window.partitionBy("contract_number").orderBy(
+        col("effective_date").desc(), col("ingestion_ts").desc()
+    )
+
+    df = df.withColumn("rn", row_number().over(window)).filter("rn = 1").drop("rn")
+
+    return df
+
+
+# ============================================================
+# SCD TYPE 1 UPSERT
+# ============================================================
+
+
+def upsert_scd1(df_incoming, table_name):
+
+    logger.info(f"SCD1 — Reading existing table: {OBJECT_NAME}")
+    df_existing = spark.table(OBJECT_NAME)
+
+    target_cols = [c.name for c in df_existing.schema.fields]
+
+    records_existing = df_existing.count()
+    records_incoming = df_incoming.count()
+
+    logger.info(f"SCD1 — Existing row count : {records_existing}")
+    logger.info(f"SCD1 — Incoming row count : {records_incoming}")
+
+    logger.info("SCD1 — Anti-join: keeping unchanged rows...")
+
+    df_unchanged = df_existing.join(
+        df_incoming.select("contract_number").distinct(),
+        on="contract_number",
+        how="left_anti",
+    )
+
+    records_unchanged = df_unchanged.count()
+    logger.info(f"SCD1 — Unchanged row count: {records_unchanged}")
+
+    logger.info("SCD1 — Union unchanged + incoming rows...")
+
+    df_result = df_unchanged.unionByName(df_incoming, allowMissingColumns=True)
+
+    df_result = df_result.select([col(c) for c in target_cols])
+
+    records_written = df_result.count()
+    logger.info(f"SCD1 — Final row count    : {records_written}")
+
+    logger.info(f"SCD1 — Full overwrite on {table_name}...")
+    df_result.writeTo(table_name).overwrite(lit(True))
+
+    logger.info("SCD1 — Upsert complete.")
+
+    records_updated = records_existing - records_unchanged
+    records_inserted = records_incoming - records_updated
+
+    return records_incoming, records_written, records_inserted, records_updated
+
+
+# ============================================================
+# AUDIT
+# ============================================================
+
+
+def update_audit_metrics(
+    records_read,
+    records_written,
+    records_inserted,
+    records_updated,
+    records_deleted=0,
+    records_rejected=0,
+):
+
+    logger.info(f"Updating audit metrics for {EXECUTION_ID}")
+
+    spark.sql(
+        f"""
+        UPDATE glue_catalog.edp_configs_dev.pipeline_execution_summary
+        SET
+            records_read      = {records_read},
+            records_written   = {records_written},
+            records_inserted  = {records_inserted},
+            records_updated   = {records_updated},
+            records_deleted   = {records_deleted},
+            records_rejected  = {records_rejected}
+        WHERE etl_run_id = '{EXECUTION_ID}'
+        AND layer='SILVER'
+    """
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+try:
+
+    df = read_bronze()
+
+    if df.limit(1).count() == 0:
+        logger.info("No data found, exiting")
+        update_audit_metrics(0, 0, 0, 0)
+        job.commit()
+        sys.exit(0)
+
+    df_final = transform(df)
+
+    table_name = f"s3tables.{DB}.{OBJECT_NAME}"
+
+    records_read, records_written, records_inserted, records_updated = upsert_scd1(
+        df_final, table_name
+    )
+
+    update_audit_metrics(
+        records_read, records_written, records_inserted, records_updated
+    )
+
+    job.commit()
+
+except Exception as e:
+    logger.error(str(e))
+    raise

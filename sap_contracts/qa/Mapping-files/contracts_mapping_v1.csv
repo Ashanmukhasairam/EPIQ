@@ -1,0 +1,49 @@
+source_system,source_object,source_field,target_field,target_datatype,is_nullable,is_active,is_silver,is_gold,is_primary_key,is_hash_key,bronze_folder,sensitivity,dataclassification,data_layer,domain,data_owner,data_quality,environment,data_retention_days,compliance
+sap,contract_list,ContractNumber,contract_number,STRING,FALSE,TRUE,TRUE,TRUE,TRUE,FALSE,contractlists,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_list,SalesOrganization,sales_organization,STRING,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractlists,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_list,CreatedDate,created_date,DATE,TRUE,TRUE,TRUE,TRUE,FALSE,FALSE,contractlists,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_list,ContractDate,contract_date,DATE,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractlists,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_list,ChangedDate,changed_date,DATE,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractlists,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,contractnumber,contract_number,string,FALSE,TRUE,TRUE,TRUE,TRUE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,contractdescription,contract_description,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,contractstartdate,contract_start_date,date,TRUE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,salesorganization,sales_organization,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,doccurrency,doc_currency,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,soldtoparty,sold_to_party,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,restricted,pii,silver,customer,data_platform,passed,dev,180,gdpr
+sap,contract_header,soldtopartytext,sold_to_party_text,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,restricted,pii,silver,customer,data_platform,passed,dev,180,gdpr
+sap,contract_header,billtoparty,bill_to_party,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,restricted,pii,silver,customer,data_platform,passed,dev,180,gdpr
+sap,contract_header,billtopartytext,bill_to_party_text,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,restricted,pii,silver,customer,data_platform,passed,dev,180,gdpr
+sap,contract_header,payer,payer,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,restricted,pii,silver,customer,data_platform,passed,dev,180,gdpr
+sap,contract_header,shiptoparty,ship_to_party,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,restricted,pii,silver,customer,data_platform,passed,dev,180,gdpr
+sap,contract_header,primaryprojectmanager,primary_project_manager,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,restricted,pii,silver,customer,data_platform,passed,dev,180,gdpr
+sap,contract_header,salesoffice,sales_office,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,salesgroup,sales_group,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,clientmatter,client_matter,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,customerreference,customer_reference,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,lsprojectcode,ls_project_code,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,pricingdate,pricing_date,date,TRUE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,headerbillingblock,header_billing_block,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,materialcontributionflag,material_contribution_flag,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,annualpriceescoverridepercent,annual_price_esc_override_percent,"decimal(5, 2)",FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,confidential,financial,silver,customer,data_platform,passed,dev,720,gdpr
+sap,contract_header,annualpriceesccontractlanguage,annual_price_esc_contract_language,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,projectnumber,project_number,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_header,customergroup,customer_group,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,contractnumber,contract_number,string,FALSE,TRUE,TRUE,TRUE,TRUE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,itemid,item_id,string,FALSE,TRUE,TRUE,TRUE,TRUE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,material,material,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,itemdescription,item_description,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,itemcategory,item_category,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,highlevelitem,high_level_item,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,orderquantity,order_quantity,"decimal(18, 3)",FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,confidential,financial,silver,customer,data_platform,passed,dev,720,gdpr
+sap,contract_items,salesunit,sales_unit,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,netvalue,net_value,"decimal(18, 2)",FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,confidential,financial,silver,customer,data_platform,passed,dev,720,gdpr
+sap,contract_items,customermaterial,customer_material,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,dismantlingdate,dismantling_date,date,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,revenueclass,revenue_class,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,confidential,financial,silver,customer,data_platform,passed,dev,720,gdpr
+sap,contract_items,itembillingblock,item_billing_block,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,reasonforrejection,reason_for_rejection,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,profitcenter,profit_center,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,materialgroup3,material_group_3,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,generatedmaterialcode,generated_material_code,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,internal,business,silver,customer,data_platform,passed,dev,365,
+sap,contract_items,contributionratiopercentage,contribution_ratio_percentage,"decimal(5, 2)",FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,confidential,financial,silver,customer,data_platform,passed,dev,720,gdpr
+sap,contract_items,annualpriceescoverride,annual_price_esc_override,string,FALSE,TRUE,TRUE,TRUE,FALSE,FALSE,contractdetails,confidential,financial,silver,customer,data_platform,passed,dev,720,gdpr

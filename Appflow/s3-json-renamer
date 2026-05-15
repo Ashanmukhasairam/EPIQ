@@ -1,0 +1,28 @@
+import boto3
+import urllib.parse
+
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    for record in event['Records']:
+        bucket = record['s3']['bucket']['name']
+        key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+
+        # Skip if already has .json extension
+        if key.endswith('.json'):
+            print(f"Skipping (already .json): {key}")
+            return
+
+        new_key = key + '.json'
+
+        # Copy with .json extension
+        s3.copy_object(
+            Bucket=bucket,
+            CopySource={'Bucket': bucket, 'Key': key},
+            Key=new_key
+        )
+
+        # Delete original
+        s3.delete_object(Bucket=bucket, Key=key)
+
+        print(f"Renamed: {key} -> {new_key}")

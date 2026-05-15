@@ -1,0 +1,210 @@
+import json
+import boto3
+import urllib.request
+import urllib.parse
+import base64
+import uuid
+import time
+from datetime import datetime, timedelta
+
+def get_sap_credentials():
+    client = boto3.client('secretsmanager', region_name='us-east-1')  # we will update region later
+    secret = client.get_secret_value(SecretId='sap/dev/odata/credentials')
+    return json.loads(secret['SecretString'])
+
+def call_sap_api(url, username, password):
+    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+    req = urllib.request.Request(url)
+    req.add_header('Authorization', f'Basic {credentials}')
+    req.add_header('Accept', 'application/json')
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return json.loads(response.read().decode())
+
+def get_watermark_date():
+    athena = boto3.client('athena', region_name='us-east-1')  # change region if needed
+    
+    query = """
+        SELECT MAX(last_successful_watermark)
+        FROM edp_configs_dev.edp_incremental_control
+        WHERE table_name = 'contracts'
+    """
+    
+    # Run the query
+    response = athena.start_query_execution(
+        QueryString=query,
+        ResultConfiguration={
+            'OutputLocation': 's3://aws-athena-query-results-us-east-1-730878889077/'
+        }
+    )
+    
+    query_execution_id = response['QueryExecutionId']
+    print(f"Athena query started: {query_execution_id}")
+    
+    # Wait for query to complete
+    while True:
+        status = athena.get_query_execution(QueryExecutionId=query_execution_id)
+        state = status['QueryExecution']['Status']['State']
+        print(f"Athena query state: {state}")
+        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            break
+        time.sleep(2)
+    
+    if state != 'SUCCEEDED':
+        error_reason = status['QueryExecution']['Status'].get('StateChangeReason', 'No reason provided')
+        print(f"Athena failure reason: {error_reason}")
+        raise Exception(f"Athena query failed with state: {state}. Reason: {error_reason}")
+    
+    # Get the result
+    result = athena.get_query_results(QueryExecutionId=query_execution_id)
+    rows = result['ResultSet']['Rows']
+    
+    # Row 0 is header, Row 1 is actual value
+    watermark_value = rows[1]['Data'][0].get('VarCharValue', None)
+    print(f"Watermark from Athena: {watermark_value}")
+    
+    if watermark_value and watermark_value != '':
+        # watermark may come as full timestamp like '2026-01-15 00:00:00' — take only date part
+        start_date = watermark_value[:10]
+    else:
+        # If no watermark found fallback to last 30 days
+        print("No watermark found, falling back to last 30 days")
+        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    
+    print(f"Using start_date: {start_date}")
+    return start_date
+
+
+def get_date_chunks(start_date_str, end_date_str, months=3):
+    """Split a date range into chunks of N months."""
+    chunks = []
+    current = datetime.strptime(start_date_str, '%Y-%m-%d')
+    end = datetime.strptime(end_date_str, '%Y-%m-%d')
+
+    while current < end:
+        chunk_end = current + timedelta(days=months * 30)
+        if chunk_end > end:
+            chunk_end = end
+        chunks.append((current.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
+        current = chunk_end + timedelta(days=1)
+
+    return chunks
+
+
+def get_contract_list(creds, mode='incremental'):
+    base_url = creds['sap_base_url']
+    sap_path = creds['sap_path']
+    end_date = datetime.now().strftime('%Y-%m-%d')
+
+    if mode == 'historical':
+        start_date = '2021-01-01'
+        print(f"HISTORICAL mode: loading from {start_date} to {end_date}")
+    else:
+        start_date = get_watermark_date()
+        print(f"INCREMENTAL mode: loading from {start_date} to {end_date}")
+
+    all_contracts = []
+    PAGE_SIZE = 5000
+    chunks = get_date_chunks(start_date, end_date, months=3)
+    print(f"Date range split into {len(chunks)} chunks of 3 months")
+
+    for chunk_start, chunk_end in chunks:
+        print(f"\n=== Processing chunk: {chunk_start} to {chunk_end} ===")
+
+        for attribute in ['CREATE', 'CHANGE']:
+            skip = 0
+            while True:
+                filter_str = f"ContractDate ge {chunk_start} and ContractDate le {chunk_end} and attribute eq '{attribute}'"
+                encoded_filter = urllib.parse.quote(filter_str)
+
+                url = (
+                    f"{base_url}{sap_path}"
+                    f"ZSD_API_CONTRACT_LIST"
+                    f"?$filter={encoded_filter}"
+                    f"&$select=ContractNumber,SalesOrganization,ContractDate,CreatedDate,ChangedDate,ContractTime,attribute"
+                    f"&$top={PAGE_SIZE}&$skip={skip}&$format=json"
+                )
+                print(f"Calling ContractList for attribute={attribute}, chunk={chunk_start}-{chunk_end}, skip={skip}")
+                response = call_sap_api(url, creds['username'], creds['password'])
+                records = response.get('value', [])
+                print(f"attribute={attribute}, skip={skip} returned {len(records)} records")
+                all_contracts.extend(records)
+
+                if len(records) < PAGE_SIZE:
+                    break
+                skip += PAGE_SIZE
+
+    print(f"\nTotal contracts combined: {len(all_contracts)}")
+    return {'value': all_contracts}
+
+def get_contract_details(contract_number, creds):
+    base_url = creds['sap_base_url']
+    url = (
+        f"{base_url}/sap/opu/odata4/sap/zsb_contracts_data_api/srvd_a2x/sap/zsd_contracts_data_api/0001/"
+        f"ContractHeader('{contract_number}')?$expand=_ContractItems&$format=json"
+    )
+    print(f"ContractDetails URL: {url}")
+    return call_sap_api(url, creds['username'], creds['password'])
+
+def save_to_s3(data, bucket_name, key):
+    s3 = boto3.client('s3')
+    s3.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=json.dumps(data, indent=2),
+        ContentType='application/json'
+    )
+    print(f"Saved to s3://{bucket_name}/{key}")
+
+def lambda_handler(event, context):
+    S3_BUCKET = 'epiq-edp-dl-dev-bronze'
+    now = datetime.now()
+    date_path = now.strftime('%Y/%m/%d')
+    hh = now.strftime('%H')
+    mm = now.strftime('%M')
+    seconds = now.strftime('%H%M%S')
+    unique_id = str(uuid.uuid4())
+    filename = f"part-00000-{unique_id}-c000.json"
+
+    try:
+        creds = get_sap_credentials()
+
+        mode = event.get('mode', 'incremental')  # 'historical' or 'incremental'
+        print(f"Running in {mode} mode")
+
+        print("Fetching Contract List...")
+        contract_list_data = get_contract_list(creds, mode=mode)
+        save_to_s3(contract_list_data, S3_BUCKET, f"sap/contracts/contract_list/{date_path}/{hh}/{mm}/{filename}")
+
+
+        contracts = contract_list_data.get('value', [])
+        print(f"Found {len(contracts)} contracts. Fetching details...")
+
+        all_details = []
+        for contract in contracts:
+            contract_number = contract.get('ContractNumber')
+            if contract_number:
+                try:
+                    details = get_contract_details(contract_number, creds)
+                    all_details.append(details)
+                except Exception as e:
+                    print(f"Error for {contract_number}: {e}")
+
+        save_to_s3(all_details, S3_BUCKET, f"sap/contracts/contract_details/{date_path}/{hh}/{mm}/{filename}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Success',
+                'contracts_fetched': len(contracts),
+                'details_fetched': len(all_details),
+                'contract_list': contract_list_data,        # <-- actual list data
+                'contract_details': all_details             # <-- actual details data
+            })
+        }
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }

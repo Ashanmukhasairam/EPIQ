@@ -1,0 +1,450 @@
+'''
+aws glue start-job-run \
+--job-name edp-qa-sap-silver-contract_header_items \
+--arguments '{
+  "--ACCOUNT_ID":"730878889077",
+  "--AIRFLOW_RUN_ID":"manual_run",
+  "--BRONZE_BUCKET_NAME":"epiq-edp-dl-qa-bronze",
+  "--CONFIG_BUCKET":"epiq-edp-dl-qa-configs",
+  "--ETL_RUN_DATE":"2026-04-13",
+  "--EXECUTION_ID":"silver_2026_04_13",
+  "--SILVER_DATABASE":"silver_sap_db",
+  "--SOURCE":"sap",
+  "--TABLE_BUCKET_NAME":"epiq-edp-dl-qa-silver",
+  "--SILVER_TABLE":"contract_header,contract_items"
+}'
+'''
+
+# ============================================================
+# SAP SILVER GLUE JOB contract_header,contract_items
+# ============================================================
+import sys
+import re
+import logging
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+from datetime import datetime, date
+from pyspark.sql.functions import col, lit, current_timestamp, to_date, explode, row_number, md5, concat_ws
+from pyspark.sql.types import DecimalType, StringType, IntegerType, DoubleType
+from pyspark.sql import functions as F
+import boto3
+
+# ============================================================
+# Logging
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Arguments
+# ============================================================
+
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "ACCOUNT_ID",
+        "AIRFLOW_RUN_ID",
+        "BRONZE_BUCKET_NAME",
+        "CONFIG_BUCKET",
+        "ETL_RUN_DATE",
+        "EXECUTION_ID",
+        "SILVER_DATABASE",
+        "SOURCE",
+        "TABLE_BUCKET_NAME",
+        "SILVER_TABLE"
+    ],
+)
+
+JOB_NAME = args["JOB_NAME"]
+ACCOUNT_ID = args["ACCOUNT_ID"]
+AIRFLOW_RUN_ID = args["AIRFLOW_RUN_ID"]
+BRONZE_BUCKET = args["BRONZE_BUCKET_NAME"]
+CONFIG_BUCKET = args["CONFIG_BUCKET"]
+ETL_RUN_DATE = args["ETL_RUN_DATE"]
+EXECUTION_ID = args["EXECUTION_ID"]
+DB = args["SILVER_DATABASE"]
+SOURCE = args["SOURCE"]
+TABLE_BUCKET_NAME = args["TABLE_BUCKET_NAME"]
+SILVER_TABLE = args["SILVER_TABLE"]
+
+# ============================================================
+# Spark Session
+# ============================================================
+
+spark = (
+    SparkSession.builder.appName(JOB_NAME)
+    .config("spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.defaultCatalog", "s3tables")
+    .config("spark.sql.catalog.s3tables",
+            "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.s3tables.catalog-impl",
+            "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config("spark.sql.catalog.s3tables.glue.id",
+            f"{ACCOUNT_ID}:s3tablescatalog/{TABLE_BUCKET_NAME}")
+    .config("spark.sql.catalog.s3tables.warehouse", TABLE_BUCKET_NAME)
+    .config("spark.sql.catalog.glue_catalog",
+            "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.glue_catalog.catalog-impl",
+            "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config("spark.sql.catalog.glue_catalog.glue.region",
+            "us-east-1")
+    .config("spark.sql.session.timeZone", "UTC")
+    .getOrCreate()
+)
+
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
+job.init(JOB_NAME, args)
+
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS s3tables.{DB}")
+
+# ============================================================
+# READ MAPPING
+# ============================================================
+
+
+def read_mapping(base_object):
+
+    mapping_path = f"s3://{CONFIG_BUCKET}/{SOURCE}/mappings/contracts_mapping.csv"
+
+    df = (
+        spark.read.option("header", "true")
+        .csv(mapping_path)
+        .filter(
+            (col("source_system") == SOURCE) &
+            (col("source_object") == base_object) &
+            (col("is_active") == "TRUE") &
+            (col("is_silver") == "TRUE")
+        )
+    )
+
+    rows = df.collect()
+
+    if not rows:
+        raise Exception(f"Mapping not found for {base_object}")
+
+    # Extract primary key columns
+    pk_columns = (
+        df.filter(col("is_primary_key") == "TRUE")
+        .select("target_field")
+        .rdd.flatMap(lambda x: x)
+        .collect()
+    )
+
+    if not pk_columns:
+        raise Exception(f"No primary key defined for {base_object} in mapping")
+
+    return rows, pk_columns
+    
+# ============================================================
+# CREATE TABLE
+# ============================================================
+
+def create_ddl(base_object, mapping_rows):
+
+    ddl_columns = []
+
+    for row in mapping_rows:
+
+        target = row["target_field"].strip()
+        dtype = row["target_datatype"].strip().lower().replace(" ", "")
+
+        if dtype.startswith("decimal"):
+            nums = re.findall(r"\d+", dtype)
+            ddl_columns.append(f"{target} decimal({nums[0]},{nums[1]})")
+
+        elif dtype == "date":
+            ddl_columns.append(f"{target} date")
+
+        elif dtype == "int":
+            ddl_columns.append(f"{target} int")
+
+        elif dtype == "double":
+            ddl_columns.append(f"{target} double")
+
+        else:
+            ddl_columns.append(f"{target} string")
+
+    ddl_columns.extend([
+        "execution_id string",
+        "airflow_run_id string",
+        "etl_run_date string",
+        "source_system string",
+        "ingestion_ts timestamp",
+    ])
+
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS s3tables.{DB}.{base_object}
+        ({', '.join(ddl_columns)})
+        USING iceberg
+        PARTITIONED BY (etl_run_date)
+    """)
+
+# ============================================================
+# READ BRONZE
+# ============================================================
+
+def read_bronze(folder, etl_run_date):
+    if etl_run_date is None:
+        etl_run_date = datetime.today()
+        
+    if isinstance(etl_run_date, str):
+        etl_run_date = datetime.strptime(etl_run_date, "%Y-%m-%d")
+        
+    year = etl_run_date.strftime("%Y")
+    month = etl_run_date.strftime("%m")
+    day = etl_run_date.strftime("%d")
+    path = f"s3://{BRONZE_BUCKET}/{SOURCE}/contracts/{folder}-qa/{year}/{month}/{day}/"
+    df = spark.read.option("recursiveFileLookup", "true").json(path)
+    rows_read = df.count()
+    return df, rows_read
+
+# ============================================================
+# TRANSFORM
+# ============================================================
+def transform_data(bronze_df, mapping_rows, base_object, pk_cols):
+
+    if base_object == "contract_items":
+        bronze_df = bronze_df.select(
+            col("ContractNumber"),
+            explode(col("ContractItems")).alias("item")
+        ).select(col("ContractNumber"), col("item.*"))
+
+    select_expr = []
+
+    for row in mapping_rows:
+
+        source = row["source_field"].strip()
+        target = row["target_field"].strip()
+        dtype = row["target_datatype"].strip().lower().replace(" ", "")
+
+        if dtype.startswith("decimal"):
+            nums = re.findall(r"\d+", dtype)
+            select_expr.append(
+                col(source).cast(
+                    DecimalType(int(nums[0]), int(nums[1]))
+                ).alias(target)
+            )
+
+        elif dtype == "date":
+            select_expr.append(to_date(col(source)).alias(target))
+
+        elif dtype == "int":
+            select_expr.append(col(source).cast(IntegerType()).alias(target))
+
+        elif dtype == "double":
+            select_expr.append(col(source).cast(DoubleType()).alias(target))
+
+        else:
+            select_expr.append(col(source).cast(StringType()).alias(target))
+
+    df = bronze_df.select(*select_expr)
+
+    # Use primary keys from mapping
+    for pk in pk_cols:
+        if pk in df.columns:
+            df = df.filter(col(pk).isNotNull())
+
+    df = (
+        df.withColumn("execution_id", lit(EXECUTION_ID))
+        .withColumn("airflow_run_id", lit(AIRFLOW_RUN_ID))
+        .withColumn("etl_run_date", lit(ETL_RUN_DATE))
+        .withColumn("source_system", lit(SOURCE))
+        .withColumn("ingestion_ts", current_timestamp())
+    )
+
+    # Deduplication — deterministic ranking using content hash as tiebreaker
+    business_cols = [row["target_field"].strip() for row in mapping_rows]
+    df = df.withColumn(
+        "_row_hash",
+        md5(concat_ws("||", *[col(c).cast("string") for c in business_cols]))
+    )
+
+    window = Window.partitionBy(*pk_cols).orderBy(
+        col("ingestion_ts").desc(),
+        col("_row_hash").asc()
+    )
+
+    df_ranked = df.withColumn("rn", row_number().over(window))
+
+    total_rows = df_ranked.count()
+    df_clean = df_ranked.filter(col("rn") == 1).drop("rn", "_row_hash")
+    df_duplicates = df_ranked.filter(col("rn") > 1).drop("rn", "_row_hash")
+
+    dup_count = df_duplicates.count()
+    logger.info(f"[{base_object}] Total: {total_rows} | Clean: {total_rows - dup_count} | Duplicates: {dup_count}")
+
+    return df_clean, df_duplicates
+    
+# ============================================================
+# PROCESS TABLE
+# ============================================================
+
+def process_object(base_object, bronze_df, rows_read):
+
+    table_name = f"s3tables.{DB}.{base_object}"
+    print(table_name)
+    mapping_rows, pk_columns = read_mapping(base_object)
+
+    if not spark.catalog.tableExists(table_name):
+        create_ddl(base_object, mapping_rows)
+
+    df_clean, df_duplicates = transform_data(
+        bronze_df, mapping_rows, base_object, pk_columns
+    )
+
+    rows_written = df_clean.count()
+    records_rejected = df_duplicates.count()
+    
+    # Write clean data
+    df_clean.writeTo(table_name).overwritePartitions()
+
+    # Write duplicates to S3 logs with proper folder structure
+    if records_rejected > 0:
+
+        today = str(date.today())
+        log_path = f"s3://{CONFIG_BUCKET}/logs/{SOURCE}/{base_object}/log_date={today}/"
+
+        logger.info(f"Writing {records_rejected} duplicate(s) for {base_object} to {log_path}")
+
+        (
+            df_duplicates
+            .write
+            .mode("overwrite")
+            .parquet(log_path)
+        )
+
+        logger.info(f"Duplicates written to {log_path}")
+
+        # Clean up _$folder$ marker files created by Hadoop on S3
+        delete_folder_markers(CONFIG_BUCKET, f"logs/{SOURCE}/{base_object}/")
+
+    else:
+        logger.info(f"No duplicates found for {base_object}")
+
+    return (base_object, rows_read, rows_written, records_rejected)
+    
+# ============================================================
+# AUDIT UPDATE FUNCTION
+# ============================================================
+def update_audit(table_name, rows_read=None, rows_written=None, records_rejected=None,
+                 status=None, error_message=None):
+
+    table_ref = "glue_catalog.edp_configs_dev.pipeline_execution_summary"
+
+    safe_error = error_message.replace("'", " ") if error_message else None
+
+    if status == "FAILED":
+
+        query = f"""
+        UPDATE {table_ref}
+        SET
+            status = 'FAILED',
+            error_message = '{safe_error}',
+            pipeline_end_time = current_timestamp(),
+            duration_seconds =
+                unix_timestamp(current_timestamp()) -
+                unix_timestamp(pipeline_start_time)
+        WHERE etl_run_id = '{EXECUTION_ID}'
+          AND run_id = '{AIRFLOW_RUN_ID}'
+          AND layer = 'SILVER'
+          AND environment='DEV'
+          AND table_name = '{table_name}'
+        """
+
+        logger.info(f"AUDIT UPDATE (FAILED):\n{query}")
+        spark.sql(query)
+
+    elif status == "SUCCESS":
+
+        query = f"""
+        UPDATE {table_ref}
+        SET
+            records_read = {rows_read},
+            records_written = {rows_written},
+            records_rejected = {records_rejected},
+            status = 'SUCCESS',
+            error_message = NULL,
+            pipeline_end_time = current_timestamp(),
+            duration_seconds =
+                unix_timestamp(current_timestamp()) -
+                unix_timestamp(pipeline_start_time)
+        WHERE etl_run_id = '{EXECUTION_ID}'
+          AND run_id = '{AIRFLOW_RUN_ID}'
+          AND layer = 'SILVER'
+          AND environment='DEV'
+          AND table_name = '{table_name}'
+        """
+
+        logger.info(f"AUDIT UPDATE (SUCCESS):\n{query}")
+        spark.sql(query)
+
+# ============================================================
+# DELETE S3 FOLDER MARKERS
+# ============================================================
+
+def delete_folder_markers(bucket_name, prefix):
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+
+    markers_to_delete = []
+    for page in pages:
+        for obj in page.get("Contents", []):
+            if "$folder$" in obj["Key"]:
+                markers_to_delete.append({"Key": obj["Key"]})
+
+    if markers_to_delete:
+        s3.delete_objects(Bucket=bucket_name, Delete={"Objects": markers_to_delete})
+        logger.info(f"Deleted {len(markers_to_delete)} _$folder$ marker file(s) under {prefix}")
+
+# ============================================================
+# MAIN
+# ============================================================
+
+try:
+
+    tables = [t.strip().lower() for t in SILVER_TABLE.split(",")]
+
+    for table in tables:
+
+        logger.info(f"Processing table: {table}")
+
+        if table in ("contract_header", "contract_items"):
+            print(f"reading {table} data from bronze")
+            bronze_df, rows_read = read_bronze("contractdetails",ETL_RUN_DATE)
+
+        else:
+            raise ValueError(f"Invalid table {table}")
+
+        table_name, rows_read, rows_written, records_rejected = process_object(table, bronze_df, rows_read)
+        print("final before audit",table_name, rows_read, rows_written,records_rejected)
+        
+        update_audit(
+            table_name=table_name,
+            rows_read=rows_read,
+            rows_written=rows_written,
+            records_rejected=records_rejected,
+            status="SUCCESS"
+        )
+
+    job.commit()
+
+    logger.info("Silver job completed successfully")
+
+except Exception as e:
+
+    logger.error(f"Job failed: {str(e)}")
+    table_name = SILVER_TABLE if 'SILVER_TABLE' in locals() else "UNKNOWN"
+    update_audit(
+        table_name=table_name,
+        status="FAILED",
+        error_message=str(e)
+    )
+    raise

@@ -1,0 +1,7 @@
+Alert mechanism when the connection got failed and we need email notification.
+
+read and load in silver layer --> where condition always in silver table.[Snapshotting] [archival process]
+
+Asmitha ----> table buckets instead of s3 buckets.
+
+

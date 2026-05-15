@@ -1,0 +1,58 @@
+{
+  "TABLE_NAME": "contract_list",
+  "SOURCE_SYSTEM": "SAP",
+  "ENVIRONMENT": "QA",
+  "DATABASE_NAME": "edp_configs_dev",
+  "SUMMARY_TABLE": "pipeline_execution_summary",
+  "CONTROL_TABLE": "edp_incremental_control",
+  "AWS_CONN_ID": "aws_default",
+  "ATHENA_OUTPUT": "s3://edp-athena-dl-results/",
+  "LAYERS": {
+    "SILVER": {
+      "PIPELINE_NAME": "sap_contractlist_silver_pipeline",
+      "LOAD_TYPE": "TRANSFORM",
+      "SILVER_DATABASE": "silver_sap_db",
+      "SILVER_TABLE": "contract_list",
+      "ACCOUNT_ID": "730878889077",
+      "TABLE_BUCKET_NAME": "epiq-edp-dl-qa-silver",
+      "BRONZE_BUCKET_NAME": "epiq-edp-dl-dev-bronze",
+      "CONFIG_BUCKET": "epiq-edp-dl-qa-configs",
+      "AWS_REGION": "us-east-1",
+      "SOURCE": "sap",
+      "GLUE_JOBS": [
+        {
+          "JOB_NAME": "edp-qa-sap-silver-contractlists",
+          "TABLES": [
+            "contract_list"
+          ]
+        }
+      ],
+      "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:730878889077:bronze-glue-alerts",
+      "SNS_TOPIC_ARN_FAILURE": "arn:aws:sns:us-east-1:730878889077:bronze-glue-alerts",
+      "NEXT_LAYER": "GOLD"
+    },
+    "GOLD": {
+      "PIPELINE_NAME": "sap_contractlist_gold_pipeline",
+      "LOAD_TYPE": "AGGREGATION",
+      "ACCOUNT_ID": "730878889077",
+      "CONFIG_BUCKET": "epiq-edp-dl-qa-configs",
+      "SOURCE": "sap",
+      "SILVER_BUCKET": "epiq-edp-dl-qa-silver",
+      "GOLD_BUCKET": "epiq-edp-dl-qa-gold",
+      "SILVER_DATABASE": "silver_sap_db",
+      "GOLD_DATABASE": "gold_sap_db",
+      "AWS_REGION": "us-east-1",
+      "GOLD_TABLE": "contract_list",
+      "GLUE_JOBS": [
+        {
+          "JOB_NAME": "edp-qa-sap-gold-contractlists",
+          "TYPE": "AGGREGATION",
+          "INPUT_TABLE": "contract_list",
+          "OUTPUT_TABLE": "contract_list"
+        }
+      ],
+      "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:730878889077:bronze-glue-alerts",
+      "SNS_TOPIC_ARN_FAILURE": "arn:aws:sns:us-east-1:730878889077:bronze-glue-alerts"
+    }
+  }
+}
