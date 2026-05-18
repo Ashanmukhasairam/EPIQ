@@ -1,0 +1,78 @@
+# =========================
+# SILVER - CONTRACT LISTS
+# =========================
+aws glue start-job-run \
+--job-name edp-qa-sap-silver-contractlists \
+--arguments '{
+"--ACCOUNT_ID":"730878889077",
+"--AIRFLOW_RUN_ID":"manual_run",
+"--BRONZE_BUCKET_NAME":"epiq-edp-dl-qa-bronze",
+"--CONFIG_BUCKET":"epiq-edp-dl-qa-configs",
+"--ETL_RUN_DATE":"2026-05-14",
+"--EXECUTION_ID":"silver_2026_05_14",
+"--SILVER_DATABASE":"silver_sap_db",
+"--SOURCE":"sap",
+"--TABLE_BUCKET_NAME":"epiq-edp-dl-qa-silver",
+"--SILVER_TABLE":"contract_list"
+}'
+
+
+# =========================
+# SILVER - CONTRACT DETAILS
+# =========================
+aws glue start-job-run \
+--job-name edp-qa-sap-silver-contractdetails \
+--arguments '{
+"--ACCOUNT_ID":"730878889077",
+"--AIRFLOW_RUN_ID":"manual_run",
+"--BRONZE_BUCKET_NAME":"epiq-edp-dl-qa-bronze",
+"--CONFIG_BUCKET":"epiq-edp-dl-qa-configs",
+"--ETL_RUN_DATE":"2026-05-14",
+"--EXECUTION_ID":"silver_2026_05_14",
+"--SILVER_DATABASE":"silver_sap_db",
+"--SOURCE":"sap",
+"--TABLE_BUCKET_NAME":"epiq-edp-dl-qa-silver",
+"--SILVER_TABLE":"contract_header,contract_items"
+}'
+
+
+# =========================
+# GOLD - CONTRACT LISTS
+# =========================
+aws glue start-job-run \
+--job-name edp-qa-sap-gold-contractlists \
+--arguments '{
+"--JOB_NAME":"edp-qa-sap-gold-contractlists",
+"--ACCOUNT_ID":"730878889077",
+"--EXECUTION_ID":"manual_run",
+"--AIRFLOW_RUN_ID":"airflow-manual-001",
+"--CONFIG_BUCKET":"epiq-edp-dl-qa-configs",
+"--SOURCE":"sap",
+"--GOLD_BUCKET":"epiq-edp-dl-qa-gold",
+"--SILVER_BUCKET":"epiq-edp-dl-qa-silver",
+"--SILVER_DATABASE":"silver_sap_db",
+"--GOLD_DATABASE":"gold_sap_db",
+"--SILVER_TABLE":"contract_list",
+"--GOLD_TABLE":"contract_list"
+}'
+
+
+# =========================
+# GOLD - CONTRACT DETAILS
+# =========================
+aws glue start-job-run \
+--job-name edp-qa-sap-gold-contractdetails \
+--arguments '{
+"--JOB_NAME":"edp-qa-sap-gold-contractdetails",
+"--ACCOUNT_ID":"730878889077",
+"--EXECUTION_ID":"manual_run",
+"--AIRFLOW_RUN_ID":"airflow-manual-001",
+"--CONFIG_BUCKET":"epiq-edp-dl-qa-configs",
+"--SOURCE":"sap",
+"--GOLD_BUCKET":"epiq-edp-dl-qa-gold",
+"--SILVER_BUCKET":"epiq-edp-dl-qa-silver",
+"--SILVER_DATABASE":"silver_sap_db",
+"--GOLD_DATABASE":"gold_sap_db",
+"--SILVER_TABLE":"contract_header,contract_items",
+"--GOLD_TABLE":"contract_header,contract_items"
+}'
