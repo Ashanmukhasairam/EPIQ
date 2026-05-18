@@ -10,6 +10,7 @@ BRONZE_BUCKET = os.environ.get("BRONZE_BUCKET")
 EXTRACTOR_ARN = os.environ.get("EXTRACTOR_LAMBDA_ARN")
 LOAD_TYPE     = os.environ.get("LOAD_TYPE", "FULL") # Default to FULL if missing
 MAX_RESPONSE_SIZE = 5 * 1024 * 1024
+RAW_JSON_FIELD_NAME = "raw_json"
 
 def invoke_extractor(payload):
     payload['LOAD_TYPE'] = LOAD_TYPE
@@ -51,46 +52,102 @@ def make_field(name, data_type):
     }
 
 
-CONTRACT_LIST_FIELDS = [
-    make_field("ContractNumber", "String"),
-    make_field("SalesOrganization", "String"),
-    make_field("ContractDate", "String"),
-    make_field("CreatedDate", "String"),
-    make_field("ChangedDate", "String"),
-    make_field("attribute", "String"),
-]
+def fetch_remote_schema(entity, env, secret_arn=None):
+    """
+    Ask the extractor Lambda for a schema definition for `entity`.
+    Expected extractor response body JSON shape (recommended):
+      {"fields": [{"name": "ContractNumber", "type": "String"}, ...]}
 
-CONTRACT_DETAILS_FIELDS = [
-    make_field("ContractNumber", "String"),
-    make_field("ContractDescription", "String"),
-    make_field("ContractStartDate", "String"),
-    make_field("SalesOrganization", "String"),
-    make_field("DocCurrency", "String"),
-    make_field("SoldToParty", "String"),
-    make_field("SoldToPartyText", "String"),
-    make_field("BillToParty", "String"),
-    make_field("BillToPartyText", "String"),
-    make_field("Payer", "String"),
-    make_field("ShipToParty", "String"),
-    make_field("PrimaryProjectManager", "String"),
-    make_field("SalesOffice", "String"),
-    make_field("SalesGroup", "String"),
-    make_field("ClientMatter", "String"),
-    make_field("CustomerReference", "String"),
-    make_field("LSProjectCode", "String"),
-    make_field("PricingDate", "String"),
-    make_field("HeaderBillingBlock", "String"),
-    make_field("MaterialContributionFlag", "String"),
-    make_field("AnnualPriceEscOverridePercent", "Double"),
-    make_field("AnnualPriceEscContractLanguage", "String"),
-    make_field("ProjectNumber", "String"),
-    make_field("CustomerGroup", "String"),
-    make_field("zzotcontract", "String"),
-    make_field("Deactivated", "String"),
-    make_field("InternalUse", "String"),
-    make_field("ClientFacing", "String"),
-    make_field("ContractItems", "String")
-]
+    Returns a list of AppFlow field dicts (from `make_field`) or None on failure.
+    """
+    try:
+        payload = {"action": "describe_entity", "entity": entity, "env": env, "secret_arn": secret_arn}
+        resp = invoke_extractor(payload)
+
+        # Support both direct body and S3 temp pattern
+        body = {}
+        if isinstance(resp, dict) and resp.get("statusCode") in (200, "200"):
+            body = json.loads(resp.get("body") or "{}")
+        elif isinstance(resp, dict) and resp.get("body"):
+            body = json.loads(resp.get("body") or "{}")
+        elif isinstance(resp, dict):
+            body = resp
+
+        fields = body.get("fields")
+        if not fields or not isinstance(fields, list):
+            logger.info("No remote schema fields returned by extractor")
+            return None
+
+        appflow_fields = []
+        for f in fields:
+            name = f.get("name") or f.get("fieldName")
+            dtype = f.get("type") or f.get("dataType") or "String"
+            if not name:
+                continue
+            appflow_fields.append(make_field(name, dtype))
+
+        logger.info(f"Fetched remote schema for {entity}: {len(appflow_fields)} fields")
+        return appflow_fields
+
+    except Exception as e:
+        logger.warning(f"fetch_remote_schema failed for {entity}: {e}")
+        return None
+
+
+def fetch_and_convert_schema(entity, env, secret_arn=None):
+    """
+    Fetch schema from the extractor and convert it to AppFlow fields with fallback.
+    Final fallback is the single `raw_json` field.
+    """
+    appflow_fields = fetch_remote_schema(entity, env, secret_arn)
+    if appflow_fields is None:
+        logger.info(f"Falling back to single raw_json field schema for {entity}")
+        return get_source_fields()
+    return appflow_fields
+
+
+def build_field_definition(field_name):
+    return {
+        "fieldName": field_name,
+        "dataType": "String",
+        "dataTypeLabel": "String",
+        "label": field_name,
+        "description": "Complete source record as stringified JSON",
+        "constraints": {
+            "isRequired": False,
+            "isUnique": False
+        },
+        "readProperties": {
+            "isRetrievable": True,
+            "isQueryable": False,
+            "isTimestampFieldForIncrementalQueries": False,
+            "isNullable": True
+        },
+        "writeProperties": {
+            "isCreatable": False,
+            "isUpdatable": False,
+            "isUpsertable": False,
+            "isDefaultedOnCreate": False,
+            "isNullable": True,
+            "supportedWriteOperations": []
+        },
+        "filterOperators": [
+            "PROJECTION"
+        ],
+        "supportedFieldTypeDetails": {
+            "fieldType": "string",
+            "filterOperators": [
+                "PROJECTION"
+            ]
+        }
+    }
+
+
+def get_source_fields():
+    fields = [build_field_definition(RAW_JSON_FIELD_NAME)]
+    logger.info(f"Returning single source field for AppFlow: {RAW_JSON_FIELD_NAME}")
+    return fields
+
 
 
 def lambda_handler(event, context):
@@ -128,7 +185,7 @@ def lambda_handler(event, context):
 
     elif request_type == "ValidateCredentialsRequest":
         return {"isSuccess": True, "errorDetails": None}
-
+    
     elif request_type == "ValidateConnectorRuntimeSettingsRequest":
         return {"isSuccess": True, "errorsByInputField": None, "errorDetails": None}
 
@@ -143,12 +200,22 @@ def lambda_handler(event, context):
         }
 
     elif request_type == "DescribeEntityRequest":
+        # Try to fetch a dynamic schema from the extractor; fall back to single `raw_json` field.
+        connector_context = event.get("connectorContext", {})
+        connection_name = connector_context.get("connectorProfileLabel", "")
+        env = "qa" if "qa" in connection_name.lower() else "dev"
+        credentials = connector_context.get("credentials", {})
+        secret_arn = credentials.get("secretArn")
+
         if entity_key == "contractlist":
-            fields, eid, label = CONTRACT_LIST_FIELDS, "ContractList", "Contract List"
+            eid, label = "ContractList", "Contract List"
         elif entity_key == "contractdetails":
-            fields, eid, label = CONTRACT_DETAILS_FIELDS, "ContractDetails", "Contract Details"
+            eid, label = "ContractDetails", "Contract Details"
         else:
             return {"isSuccess": False, "errorDetails": None, "entityDefinition": None, "cacheControl": None}
+
+        fields = fetch_and_convert_schema(eid, env, secret_arn)
+
         return {
             "isSuccess": True, "errorDetails": None,
             "entityDefinition": {
@@ -201,14 +268,22 @@ def lambda_handler(event, context):
 
             if entity_key == "contractlist":
                 for r in actual_data.get("contract_list", {}).get("value", []):
-                    records.append(json.dumps({
+                    source_record = {
                         "ContractNumber":    str(r.get("ContractNumber", "")),
                         "SalesOrganization": str(r.get("SalesOrganization", "")),
                         "ContractDate":      str(r.get("ContractDate", "")),
                         "CreatedDate":       str(r.get("CreatedDate", "")),
                         "ChangedDate":       str(r.get("ChangedDate", "")),
                         "attribute":         str(r.get("attribute", ""))
-                    }))
+                    }
+                    appflow_record = {RAW_JSON_FIELD_NAME: json.dumps(source_record, ensure_ascii=False, default=str)}
+                    record = json.dumps(appflow_record, ensure_ascii=False)
+                    record_size = len(record.encode("utf-8"))
+                    if current_size + record_size > MAX_RESPONSE_SIZE:
+                        logger.info("Size limit hit while building contract list page")
+                        return {"isSuccess": True, "records": records, "nextToken": str(offset)}
+                    records.append(record)
+                    current_size += record_size
 
             elif entity_key == "contractdetails":
                 MAX_ITEMS_PER_CHUNK = 1000
@@ -223,7 +298,7 @@ def lambda_handler(event, context):
                     logger.info(f"Contract {cn}: {total_items} items")
 
                     if total_items == 0:
-                        record = json.dumps({
+                        source_record = {
                             "ContractNumber":                 cn,
                             "ContractDescription":            str(c.get("ContractDescription", "")),
                             "ContractStartDate":              str(c.get("ContractStartDate", "")),
@@ -248,12 +323,14 @@ def lambda_handler(event, context):
                             "AnnualPriceEscContractLanguage": str(c.get("AnnualPriceEscContractLanguage", "")),
                             "ProjectNumber":                  str(c.get("ProjectNumber", "")),
                             "CustomerGroup":                  str(c.get("CustomerGroup", "")),
-                            "zzotcontract":                  str(c.get("zzotcontract", "")),
-                            "Deactivated":                  str(c.get("Deactivated", "")),
-                            "InternalUse":                  str(c.get("InternalUse", "")),
-                            "ClientFacing":                  str(c.get("ClientFacing", "")),
+                            "zzotcontract":                   str(c.get("zzotcontract", "")),
+                            "Deactivated":                    str(c.get("Deactivated", "")),
+                            "InternalUse":                    str(c.get("InternalUse", "")),
+                            "ClientFacing":                   str(c.get("ClientFacing", "")),
                             "ContractItems":                  []
-                        })
+                        }
+                        appflow_record = {RAW_JSON_FIELD_NAME: json.dumps(source_record, ensure_ascii=False, default=str)}
+                        record = json.dumps(appflow_record, ensure_ascii=False)
                         record_size = len(record.encode("utf-8"))
                         if current_size + record_size > MAX_RESPONSE_SIZE:
                             logger.info(f"Size limit hit at contract {cn}")
@@ -297,6 +374,40 @@ def lambda_handler(event, context):
                                 "ContractItems":                  chunk_items
                             })
 
+                            source_record = {
+                                "ContractNumber":                 cn,
+                                "ContractDescription":            str(c.get("ContractDescription", "")),
+                                "ContractStartDate":              str(c.get("ContractStartDate", "")),
+                                "SalesOrganization":              str(c.get("SalesOrganization", "")),
+                                "DocCurrency":                    str(c.get("DocCurrency", "")),
+                                "SoldToParty":                    str(c.get("SoldToParty", "")),
+                                "SoldToPartyText":                str(c.get("SoldToPartyText", "")),
+                                "BillToParty":                    str(c.get("BillToParty", "")),
+                                "BillToPartyText":                str(c.get("BillToPartyText", "")),
+                                "Payer":                          str(c.get("Payer", "")),
+                                "ShipToParty":                    str(c.get("ShipToParty", "")),
+                                "PrimaryProjectManager":          str(c.get("PrimaryProjectManager", "")),
+                                "SalesOffice":                    str(c.get("SalesOffice", "")),
+                                "SalesGroup":                     str(c.get("SalesGroup", "")),
+                                "ClientMatter":                   str(c.get("ClientMatter", "")),
+                                "CustomerReference":              str(c.get("CustomerReference", "")),
+                                "LSProjectCode":                  str(c.get("LSProjectCode", "")),
+                                "PricingDate":                    str(c.get("PricingDate", "")),
+                                "HeaderBillingBlock":             str(c.get("HeaderBillingBlock", "")),
+                                "MaterialContributionFlag":       str(c.get("MaterialContributionFlag", "")),
+                                "AnnualPriceEscOverridePercent":  c.get("AnnualPriceEscOverridePercent", 0.0),
+                                "AnnualPriceEscContractLanguage": str(c.get("AnnualPriceEscContractLanguage", "")),
+                                "ProjectNumber":                  str(c.get("ProjectNumber", "")),
+                                "CustomerGroup":                  str(c.get("CustomerGroup", "")),
+                                "zzotcontract":                   str(c.get("zzotcontract", "")),
+                                "Deactivated":                    str(c.get("Deactivated", "")),
+                                "InternalUse":                    str(c.get("InternalUse", "")),
+                                "ClientFacing":                   str(c.get("ClientFacing", "")),
+                                "ContractItems":                  chunk_items
+                            }
+
+                            appflow_record = {RAW_JSON_FIELD_NAME: json.dumps(source_record, ensure_ascii=False, default=str)}
+                            record = json.dumps(appflow_record, ensure_ascii=False)
                             record_size = len(record.encode("utf-8"))
 
                             if current_size + record_size > MAX_RESPONSE_SIZE:
