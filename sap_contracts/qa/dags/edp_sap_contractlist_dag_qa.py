@@ -1,10 +1,11 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.exceptions import AirflowException
-from datetime import timedelta
-from datetime import datetime
+from datetime import datetime, timedelta
 import boto3, json, re, time, uuid
+from airflow.providers.amazon.aws.hooks.athena import AthenaHook
 from airflow.providers.amazon.aws.operators.sns import SnsPublishOperator
+from airflow.operators.empty import EmptyOperator
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.log.logging_mixin import LoggingMixin
 import pendulum
@@ -12,22 +13,17 @@ import pendulum
 local_tz = pendulum.timezone("America/New_York")
 log = LoggingMixin().log
 
-PIPELINE_TABLES = ["contract_header", "contract_items"]
-
 # ---------------- CONFIG LOAD ---------------- #
 def load_config(**context):
-    s3_path = "s3://epiq-edp-dl-qa-configs/dags/configs/edp_sap_contractdetails_config_qa.json"
+    s3_path = "s3://epiq-edp-dl-qa-configs/dags/configs/edp_sap_contractlist_config_qa.json"
     match = re.match(r"s3://([^/]+)/(.+)", s3_path)
     s3 = boto3.client("s3")
-
     config = json.loads(
-        s3.get_object(
-            Bucket=match.group(1),
-            Key=match.group(2)
-        )["Body"].read()
+        s3.get_object(Bucket=match.group(1), Key=match.group(2))["Body"].read()
     )
     context["ti"].xcom_push(key="config", value=config)
     return config
+
 
 # ---------------- RUN ID ---------------- #
 def generate_run_id(**context):
@@ -35,6 +31,8 @@ def generate_run_id(**context):
     context["ti"].xcom_push(key="etl_run_id", value=run_id)
     return run_id
 
+
+# ---------------- ATHENA HELPER ---------------- #
 # ---------------- CONFIG LOAD ---------------- #
 # Add DynamoDB resource at the top alongside boto3 imports
 dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
@@ -128,19 +126,26 @@ def update_status(layer, status, glue_run_id, tables, **context):
         )
         log.info(f"Audit status updated to {status} for {layer_table}")
 
+
 # ---------------- GLUE WAIT ---------------- #
 def wait_for_glue(glue, job, run_id):
-    start = time.time()
-    timeout = 60 * 60
+    start_time = time.time()
+    timeout = 60 * 60  # 1 hour
+
     while True:
-        state = glue.get_job_run(JobName=job, RunId=run_id)["JobRun"]["JobRunState"]
-        if state == "SUCCEEDED":
+        status = glue.get_job_run(JobName=job, RunId=run_id)["JobRun"]["JobRunState"]
+
+        if status == "SUCCEEDED":
             return "SUCCESS"
-        if state in ["FAILED", "STOPPED", "TIMEOUT"]:
+
+        if status in ["FAILED", "STOPPED", "TIMEOUT"]:
             return "FAILED"
-        if time.time() - start > timeout:
+
+        if time.time() - start_time > timeout:
             raise AirflowException("Glue job timeout")
+
         time.sleep(5)
+
 
 # ---------------- SILVER ---------------- #
 def run_silver(**context):
@@ -150,38 +155,43 @@ def run_silver(**context):
 
     glue = boto3.client("glue")
     silver_cfg = config["LAYERS"]["SILVER"]
-    job_name = "edp-qa-sap-silver-contractdetails"
-    tables = PIPELINE_TABLES
-    glue_run_id = "NA"
+    job_name = silver_cfg["GLUE_JOBS"][0]["JOB_NAME"]
 
+    TABLE_NAME = config["TABLE_NAME"]
     try:
-        insert_audit("SILVER", tables, job_name, **context)
         response = glue.start_job_run(
             JobName=job_name,
             Arguments={
-                "--ACCOUNT_ID": silver_cfg["ACCOUNT_ID"],
-                "--AIRFLOW_RUN_ID": context["run_id"],
-                "--EXECUTION_ID": etl_run_id,
-                "--SILVER_DATABASE": silver_cfg["SILVER_DATABASE"],
-                "--SILVER_TABLE": ",".join(tables),
+                "--ACCOUNT_ID":        silver_cfg["ACCOUNT_ID"],
+                "--AIRFLOW_RUN_ID":    context["run_id"],
+                "--EXECUTION_ID":      etl_run_id,
+                "--ETL_RUN_DATE":      context["dag_run"].conf.get("etl_run_date", context["ds"]),
+                "--SILVER_DATABASE":   silver_cfg["SILVER_DATABASE"],
+                "--SILVER_TABLE":      silver_cfg["SILVER_TABLE"],
                 "--TABLE_BUCKET_NAME": silver_cfg["TABLE_BUCKET_NAME"],
-                "--BRONZE_BUCKET_NAME": silver_cfg["BRONZE_BUCKET_NAME"],
-                "--CONFIG_BUCKET": silver_cfg["CONFIG_BUCKET"],
-                "--ETL_RUN_DATE": context["dag_run"].conf.get("etl_run_date", context["ds"]),
-                "--SOURCE": silver_cfg["SOURCE"],
-                "--AWS_REGION": silver_cfg["AWS_REGION"],
+                "--BRONZE_BUCKET_NAME":silver_cfg["BRONZE_BUCKET_NAME"],
+                "--SOURCE":            silver_cfg["SOURCE"],
+                "--AWS_REGION":        silver_cfg["AWS_REGION"],
             },
         )
+
         glue_run_id = response["JobRunId"]
         status = wait_for_glue(glue, job_name, glue_run_id)
+
     except Exception as e:
-        ti.xcom_push(key="silver_error", value=str(e))
-        update_status("SILVER", "FAILED", glue_run_id, tables, **context)
+        ti.xcom_push(key="silver_error", value=f"{type(e).__name__}: {str(e)}")
+        update_status("SILVER", "FAILED", **context)
         raise
 
-    update_status("SILVER", status, glue_run_id, tables, **context)
+    update_status("SILVER", status, **context)
+
     if status != "SUCCESS":
-        raise AirflowException("Silver failed")
+        ti.xcom_push(key="silver_error", value="Glue job returned FAILED")
+        raise AirflowException(f"Silver failed for {TABLE_NAME}")
+
+    log.info("Waiting 5 seconds after silver...")
+    time.sleep(5)
+
 
 # ---------------- GOLD ---------------- #
 def run_gold(**context):
@@ -191,92 +201,154 @@ def run_gold(**context):
 
     glue = boto3.client("glue")
     gold_cfg = config["LAYERS"]["GOLD"]
-    job_name = "edp-qa-sap-gold-contractdetails"
-    tables = PIPELINE_TABLES
-    glue_run_id = "NA"
+    job_name = gold_cfg["GLUE_JOBS"][0]["JOB_NAME"]
 
+    TABLE_NAME = config["TABLE_NAME"]
     try:
-        insert_audit("GOLD", tables, job_name, **context)
         response = glue.start_job_run(
             JobName=job_name,
             Arguments={
-                "--ACCOUNT_ID": gold_cfg["ACCOUNT_ID"],
-                "--AIRFLOW_RUN_ID": context["run_id"],
-                "--EXECUTION_ID": etl_run_id,
-                "--CONFIG_BUCKET": gold_cfg["CONFIG_BUCKET"],
-                "--SOURCE": gold_cfg["SOURCE"],
-                "--SILVER_BUCKET": gold_cfg["SILVER_BUCKET"],
-                "--GOLD_BUCKET": gold_cfg["GOLD_BUCKET"],
+                "--ACCOUNT_ID":      gold_cfg["ACCOUNT_ID"],
+                "--GOLD_BUCKET":     gold_cfg["GOLD_BUCKET"],
+                "--GOLD_DATABASE":   gold_cfg["GOLD_DATABASE"],
+                "--SILVER_BUCKET":   gold_cfg["SILVER_BUCKET"],
                 "--SILVER_DATABASE": gold_cfg["SILVER_DATABASE"],
-                "--GOLD_DATABASE": gold_cfg["GOLD_DATABASE"],
-                "--SILVER_TABLE": ",".join(tables),
-                "--GOLD_TABLE": ",".join(tables),
-                "--AWS_REGION": gold_cfg["AWS_REGION"],
+                "--TABLE_NAME":      gold_cfg["GOLD_TABLE"],
+                "--EXECUTION_ID":    etl_run_id,             
+                "--AWS_REGION":      gold_cfg["AWS_REGION"],   
             },
         )
+
         glue_run_id = response["JobRunId"]
         status = wait_for_glue(glue, job_name, glue_run_id)
+
     except Exception as e:
-        ti.xcom_push(key="gold_error", value=str(e))
-        update_status("GOLD", "FAILED", glue_run_id, tables, **context)
+        ti.xcom_push(key="gold_error", value=f"{type(e).__name__}: {str(e)}")
+        update_status("GOLD", "FAILED", **context)
         raise
 
-    update_status("GOLD", status, glue_run_id, tables, **context)
-    if status != "SUCCESS":
-        raise AirflowException("Gold failed")
+    update_status("GOLD", status, **context)
 
-# ---------------- DAG ---------------- #
+    if status != "SUCCESS":
+        ti.xcom_push(key="gold_error", value="Glue job returned FAILED")
+        raise AirflowException(f"Gold failed for {TABLE_NAME}")
+
+
 default_args = {
-    "retries": 2,
-    "retry_delay": timedelta(minutes=2),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
 }
 
+# ---------------- DAG ---------------- #
 with DAG(
-    dag_id="dag-sap-contractdetails-silver-gold-pipeline",
+    dag_id="dag-sap-contractlist-silver-gold-pipeline",
     start_date=pendulum.datetime(2025, 1, 1, tz=local_tz),
-    schedule="0 11 * * *",
+    schedule="0 10 * * *",   # 10 AM US time
     catchup=False,
     default_args=default_args,
 ) as dag:
 
-    load_config_task = PythonOperator(task_id="load_config", python_callable=load_config)
-    generate_run_id_task = PythonOperator(task_id="generate_run_id", python_callable=generate_run_id)
-    run_silver_task = PythonOperator(task_id="run_silver", python_callable=run_silver)
-    run_gold_task = PythonOperator(task_id="run_gold", python_callable=run_gold, trigger_rule=TriggerRule.ALL_SUCCESS)
+    load_config_task = PythonOperator(
+        task_id="load_config",
+        python_callable=load_config,
+    )
 
+    generate_run_id_task = PythonOperator(
+        task_id="generate_run_id",
+        python_callable=generate_run_id,
+    )
+
+    audit_task = PythonOperator(
+        task_id="insert_audit",
+        python_callable=insert_audit,
+    )
+
+    run_silver_task = PythonOperator(
+        task_id="run_silver",
+        python_callable=run_silver,
+        execution_timeout=timedelta(hours=2),
+    )
+
+    gold_task = PythonOperator(
+        task_id="run_gold",
+        python_callable=run_gold,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+        execution_timeout=timedelta(hours=2),
+    )
+
+    # ---------------- SILVER SUCCESS ---------------- #
     notify_silver_success = SnsPublishOperator(
         task_id="notify_silver_success",
         target_arn="{{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['SILVER']['SNS_TOPIC_ARN'] }}",
         subject="SILVER SUCCESS",
-        message="Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['SILVER']['PIPELINE_NAME'] }}",
-        trigger_rule=TriggerRule.ALL_SUCCESS
+        message="""
+        Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['SILVER']['PIPELINE_NAME'] }}
+        Table: {{ ti.xcom_pull(task_ids='load_config', key='config')['TABLE_NAME'] }}
+        Status: SUCCESS
+        Run ID: {{ run_id }}
+        Execution Date: {{ ds }}
+        """,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+        aws_conn_id="aws_default",
     )
 
     notify_silver_failure = SnsPublishOperator(
         task_id="notify_silver_failure",
         target_arn="{{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['SILVER']['SNS_TOPIC_ARN_FAILURE'] }}",
         subject="SILVER FAILED",
-        message="Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['SILVER']['PIPELINE_NAME'] }}",
-        trigger_rule=TriggerRule.ONE_FAILED
+        message="""
+        {% set cfg = ti.xcom_pull(task_ids='load_config', key='config') %}
+        Pipeline: {{ cfg['LAYERS']['SILVER']['PIPELINE_NAME'] }}
+        Table: {{ cfg['TABLE_NAME'] }}
+        Status: FAILED
+        Run ID: {{ run_id }}
+        Execution Date: {{ ds }}
+        Error: {{ ti.xcom_pull(task_ids='run_silver', key='silver_error') or 'No error captured' }}
+        """,
+        trigger_rule=TriggerRule.ONE_FAILED,
+        aws_conn_id="aws_default",
     )
 
+    # ---------------- GOLD SUCCESS ---------------- #
     notify_gold_success = SnsPublishOperator(
         task_id="notify_gold_success",
         target_arn="{{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['SNS_TOPIC_ARN'] }}",
         subject="GOLD SUCCESS",
-        message="Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['PIPELINE_NAME'] }}",
-        trigger_rule=TriggerRule.ALL_SUCCESS
+        message="""
+        Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['PIPELINE_NAME'] }}
+        Table: {{ ti.xcom_pull(task_ids='load_config', key='config')['TABLE_NAME'] }}
+        Status: SUCCESS
+        Run ID: {{ run_id }}
+        Execution Date: {{ ds }}
+        """,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+        aws_conn_id="aws_default",
     )
 
     notify_gold_failure = SnsPublishOperator(
         task_id="notify_gold_failure",
         target_arn="{{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['SNS_TOPIC_ARN_FAILURE'] }}",
         subject="GOLD FAILED",
-        message="Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['PIPELINE_NAME'] }}",
-        trigger_rule=TriggerRule.ONE_FAILED
+        message="""
+        {% set cfg = ti.xcom_pull(task_ids='load_config', key='config') %}
+        Pipeline: {{ cfg['LAYERS']['GOLD']['PIPELINE_NAME'] }}
+        Table: {{ cfg['TABLE_NAME'] }}
+        Status: FAILED
+        Run ID: {{ run_id }}
+        Execution Date: {{ ds }}
+        Error: {{ ti.xcom_pull(task_ids='run_gold', key='gold_error') or 'No error captured' }}
+        """,
+        trigger_rule=TriggerRule.ONE_FAILED,
+        aws_conn_id="aws_default",
     )
 
-    load_config_task >> generate_run_id_task >> run_silver_task
+    # Main flow
+    load_config_task >> generate_run_id_task >> audit_task >> run_silver_task
+
+    # SILVER notifications
     run_silver_task >> [notify_silver_success, notify_silver_failure]
-    run_silver_task >> run_gold_task
-    run_gold_task >> [notify_gold_success, notify_gold_failure]
+
+    run_silver_task >> gold_task
+
+    # GOLD notifications
+    gold_task >> [notify_gold_success, notify_gold_failure]

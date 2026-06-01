@@ -13,7 +13,6 @@ import pendulum
 local_tz = pendulum.timezone("America/New_York")
 log = LoggingMixin().log
 
-
 # ---------------- CONFIG LOAD ---------------- #
 def load_config(**context):
     s3_path = "s3://epiq-edp-dl-qa-configs/dags/configs/edp_sap_contractlist_config_qa.json"
