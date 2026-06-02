@@ -241,8 +241,8 @@ with DAG(
 
     load_config_task = PythonOperator(task_id="load_config", python_callable=load_config)
     generate_run_id_task = PythonOperator(task_id="generate_run_id", python_callable=generate_run_id)
-    run_silver_task = PythonOperator(task_id="run_silver", python_callable=run_silver)
-    run_gold_task = PythonOperator(task_id="run_gold", python_callable=run_gold, trigger_rule=TriggerRule.ALL_SUCCESS)
+    run_silver_task = PythonOperator(task_id="run_silver", python_callable=run_silver, execution_timeout=timedelta(hours=2),)
+    run_gold_task = PythonOperator(task_id="run_gold", python_callable=run_gold, trigger_rule=TriggerRule.ALL_SUCCESS, execution_timeout=timedelta(hours=2),)
 
     notify_silver_success = SnsPublishOperator(
         task_id="notify_silver_success",
@@ -264,7 +264,10 @@ with DAG(
         task_id="notify_gold_success",
         target_arn="{{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['SNS_TOPIC_ARN'] }}",
         subject="GOLD SUCCESS",
-        message="Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['PIPELINE_NAME'] }}",
+        message="""
+        Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['SILVER']['PIPELINE_NAME'] }}
+        Error: {{ ti.xcom_pull(task_ids='run_silver', key='silver_error') or 'No error captured' }}
+        """,
         trigger_rule=TriggerRule.ALL_SUCCESS
     )
 
@@ -272,7 +275,10 @@ with DAG(
         task_id="notify_gold_failure",
         target_arn="{{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['SNS_TOPIC_ARN_FAILURE'] }}",
         subject="GOLD FAILED",
-        message="Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['PIPELINE_NAME'] }}",
+        message="""
+        Pipeline: {{ ti.xcom_pull(task_ids='load_config', key='config')['LAYERS']['GOLD']['PIPELINE_NAME'] }}
+        Error: {{ ti.xcom_pull(task_ids='run_gold', key='gold_error') or 'No error captured' }}
+        """,
         trigger_rule=TriggerRule.ONE_FAILED
     )
 

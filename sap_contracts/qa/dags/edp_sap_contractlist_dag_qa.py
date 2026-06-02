@@ -3,9 +3,7 @@ from airflow.operators.python import PythonOperator
 from airflow.exceptions import AirflowException
 from datetime import datetime, timedelta
 import boto3, json, re, time, uuid
-from airflow.providers.amazon.aws.hooks.athena import AthenaHook
 from airflow.providers.amazon.aws.operators.sns import SnsPublishOperator
-from airflow.operators.empty import EmptyOperator
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.log.logging_mixin import LoggingMixin
 import pendulum
@@ -66,7 +64,8 @@ def insert_audit(layer, tables, job_name, **context):
         audit_table.put_item(
             Item={
                 "etl_run_id":          etl_run_id,
-                "layer":               layer_table,   # ← composite sort key
+                "layer":               layer_table,
+                "layer_name":          layer,   # ← composite sort key
                 "run_id":              run_id,
                 "pipeline_name":       pipeline_name,
                 "source_system":       config["SOURCE_SYSTEM"],
@@ -119,6 +118,7 @@ def update_status(layer, status, glue_run_id, tables, **context):
             },
             ExpressionAttributeValues={
                 ":st":  status,
+                ":ln":  layer,
                 ":gid": str(glue_run_id),
                 ":pet": datetime.utcnow().isoformat(),
                 ":uat": datetime.utcnow().isoformat(),
@@ -156,34 +156,37 @@ def run_silver(**context):
     glue = boto3.client("glue")
     silver_cfg = config["LAYERS"]["SILVER"]
     job_name = silver_cfg["GLUE_JOBS"][0]["JOB_NAME"]
-
+    tables = [silver_cfg["SILVER_TABLE"]]   # ← define tables
+    glue_run_id = "NA"                      # ← default before glue starts
     TABLE_NAME = config["TABLE_NAME"]
+
     try:
+        insert_audit("SILVER", tables, job_name, **context)  # ← add this
         response = glue.start_job_run(
             JobName=job_name,
             Arguments={
-                "--ACCOUNT_ID":        silver_cfg["ACCOUNT_ID"],
-                "--AIRFLOW_RUN_ID":    context["run_id"],
-                "--EXECUTION_ID":      etl_run_id,
-                "--ETL_RUN_DATE":      context["dag_run"].conf.get("etl_run_date", context["ds"]),
-                "--SILVER_DATABASE":   silver_cfg["SILVER_DATABASE"],
-                "--SILVER_TABLE":      silver_cfg["SILVER_TABLE"],
+                "--ACCOUNT_ID": silver_cfg["ACCOUNT_ID"],
+                "--AIRFLOW_RUN_ID": context["run_id"],
+                "--EXECUTION_ID": etl_run_id,
+                "--SILVER_DATABASE": silver_cfg["SILVER_DATABASE"],
+                "--SILVER_TABLE": ",".join(tables),
                 "--TABLE_BUCKET_NAME": silver_cfg["TABLE_BUCKET_NAME"],
-                "--BRONZE_BUCKET_NAME":silver_cfg["BRONZE_BUCKET_NAME"],
-                "--SOURCE":            silver_cfg["SOURCE"],
-                "--AWS_REGION":        silver_cfg["AWS_REGION"],
+                "--BRONZE_BUCKET_NAME": silver_cfg["BRONZE_BUCKET_NAME"],
+                "--CONFIG_BUCKET": silver_cfg["CONFIG_BUCKET"],
+                "--ETL_RUN_DATE": context["dag_run"].conf.get("etl_run_date", context["ds"]),
+                "--SOURCE": silver_cfg["SOURCE"],
+                "--AWS_REGION": silver_cfg["AWS_REGION"],
             },
         )
-
         glue_run_id = response["JobRunId"]
         status = wait_for_glue(glue, job_name, glue_run_id)
 
     except Exception as e:
         ti.xcom_push(key="silver_error", value=f"{type(e).__name__}: {str(e)}")
-        update_status("SILVER", "FAILED", **context)
+        update_status("SILVER", "FAILED", glue_run_id, tables, **context)  # ← fixed
         raise
 
-    update_status("SILVER", status, **context)
+    update_status("SILVER", status, glue_run_id, tables, **context)  # ← fixed
 
     if status != "SUCCESS":
         ti.xcom_push(key="silver_error", value="Glue job returned FAILED")
@@ -193,7 +196,6 @@ def run_silver(**context):
     time.sleep(5)
 
 
-# ---------------- GOLD ---------------- #
 def run_gold(**context):
     ti = context["ti"]
     config = ti.xcom_pull(task_ids="load_config", key="config")
@@ -202,37 +204,42 @@ def run_gold(**context):
     glue = boto3.client("glue")
     gold_cfg = config["LAYERS"]["GOLD"]
     job_name = gold_cfg["GLUE_JOBS"][0]["JOB_NAME"]
-
+    tables = [gold_cfg["GOLD_TABLE"]]   # ← define tables
+    glue_run_id = "NA"                  # ← default before glue starts
     TABLE_NAME = config["TABLE_NAME"]
+
     try:
+        insert_audit("GOLD", tables, job_name, **context)  # ← add this
         response = glue.start_job_run(
             JobName=job_name,
             Arguments={
                 "--ACCOUNT_ID":      gold_cfg["ACCOUNT_ID"],
-                "--GOLD_BUCKET":     gold_cfg["GOLD_BUCKET"],
-                "--GOLD_DATABASE":   gold_cfg["GOLD_DATABASE"],
+                "--AIRFLOW_RUN_ID":  context["run_id"],        # ← add this
+                "--EXECUTION_ID":    etl_run_id,
+                "--CONFIG_BUCKET":   gold_cfg["CONFIG_BUCKET"],
+                "--SOURCE":          gold_cfg["SOURCE"],
                 "--SILVER_BUCKET":   gold_cfg["SILVER_BUCKET"],
+                "--GOLD_BUCKET":     gold_cfg["GOLD_BUCKET"],
                 "--SILVER_DATABASE": gold_cfg["SILVER_DATABASE"],
-                "--TABLE_NAME":      gold_cfg["GOLD_TABLE"],
-                "--EXECUTION_ID":    etl_run_id,             
-                "--AWS_REGION":      gold_cfg["AWS_REGION"],   
+                "--GOLD_DATABASE":   gold_cfg["GOLD_DATABASE"],
+                "--SILVER_TABLE":    ",".join(tables),
+                "--GOLD_TABLE":      ",".join(tables),
+                "--AWS_REGION":      gold_cfg["AWS_REGION"],
             },
         )
-
         glue_run_id = response["JobRunId"]
         status = wait_for_glue(glue, job_name, glue_run_id)
 
     except Exception as e:
         ti.xcom_push(key="gold_error", value=f"{type(e).__name__}: {str(e)}")
-        update_status("GOLD", "FAILED", **context)
+        update_status("GOLD", "FAILED", glue_run_id, tables, **context)  # ← fixed
         raise
 
-    update_status("GOLD", status, **context)
+    update_status("GOLD", status, glue_run_id, tables, **context)  # ← fixed
 
     if status != "SUCCESS":
         ti.xcom_push(key="gold_error", value="Glue job returned FAILED")
         raise AirflowException(f"Gold failed for {TABLE_NAME}")
-
 
 default_args = {
     "retries": 1,
@@ -256,11 +263,6 @@ with DAG(
     generate_run_id_task = PythonOperator(
         task_id="generate_run_id",
         python_callable=generate_run_id,
-    )
-
-    audit_task = PythonOperator(
-        task_id="insert_audit",
-        python_callable=insert_audit,
     )
 
     run_silver_task = PythonOperator(
@@ -343,7 +345,7 @@ with DAG(
     )
 
     # Main flow
-    load_config_task >> generate_run_id_task >> audit_task >> run_silver_task
+    load_config_task >> generate_run_id_task >> run_silver_task
 
     # SILVER notifications
     run_silver_task >> [notify_silver_success, notify_silver_failure]
