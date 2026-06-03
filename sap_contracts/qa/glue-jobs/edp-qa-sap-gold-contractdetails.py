@@ -153,7 +153,7 @@ def read_mapping_and_keys(base_object: str):
         spark.read.option("header", "true")
         .csv(mapping_path)
         .filter(
-            (col("source_system") == SOURCE)
+            (col("source_system") == SOURCE.lower())
             & (col("source_object") == base_object)
             & (col("is_active")     == "TRUE")
             & (col("is_gold")       == "TRUE")
@@ -389,7 +389,7 @@ def update_audit(
                 ":uat": datetime.utcnow().isoformat(),
                 ":tn":  table_name,
                 ":ln":  LAYER,
-                ":ss":  SOURCE
+                ":ss":  SOURCE,
                 ":st":  "FAILED",
             },
         )
